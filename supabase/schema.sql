@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS public.transactions (
   currency text NOT NULL DEFAULT 'TRY' CHECK (currency IN ('TRY', 'USD', 'EUR', 'GBP', 'XAU')),
   exchange_rate_to_base numeric(18, 6) NOT NULL DEFAULT 1,
   base_amount NUMERIC(14, 2) NOT NULL,
-  account_id uuid NOT NULL REFERENCES public.accounts(id) ON DELETE CASCADE,
+  account_id uuid REFERENCES public.accounts(id) ON DELETE CASCADE,
   to_account_id uuid REFERENCES public.accounts(id) ON DELETE SET NULL,
   to_amount NUMERIC(14, 2),
   category_id uuid REFERENCES public.categories(id) ON DELETE SET NULL,
@@ -201,7 +201,8 @@ CREATE TABLE IF NOT EXISTS public.transactions (
   goal_id uuid REFERENCES public.savings_goals(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  deleted_at timestamptz
+  deleted_at timestamptz,
+  CHECK (account_id IS NOT NULL OR to_account_id IS NOT NULL)
 );
 
 CREATE INDEX IF NOT EXISTS transactions_user_updated_idx

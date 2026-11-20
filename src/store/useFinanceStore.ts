@@ -14,7 +14,7 @@ import {
   recomputeDebtPaidAmount,
   recomputeGoalAmount,
 } from '@/domain/ledger';
-import { formatMoney, roundMoney, subMoney } from '@/domain/money';
+import { addMoney, formatMoney, roundMoney, subMoney } from '@/domain/money';
 import { addMonthsClamped, getFiscalMonthKey, parseIsoDate } from '@/domain/periods';
 import { advanceRuleDate, processDueRecurringRules } from '@/domain/recurring';
 import type {
@@ -169,7 +169,7 @@ export interface FinanceStoreState extends FinanceDataSnapshot {
     direction: 'deposit' | 'withdraw';
     date?: string;
     note?: string;
-  }) => Transaction;
+  }) => Transaction | null;
   deleteGoal: (id: string) => void;
 
   addDebt: (input: NewDebtInput) => Debt;
@@ -180,7 +180,7 @@ export interface FinanceStoreState extends FinanceDataSnapshot {
     accountId?: string;
     date?: string;
     note?: string;
-  }) => Transaction;
+  }) => Transaction | null;
   deleteDebt: (id: string) => void;
 
   addCategory: (input: NewCategoryInput) => Category;
@@ -1272,16 +1272,29 @@ export const useFinanceStore = create<FinanceStoreState>()(
         }
 
         const safeAmount = roundMoney(amount);
-        const txDate = date ?? new Date().toISOString().slice(0, 10);
+        const linkedAccountId = accountId?.trim() || '';
         const isDeposit = direction === 'deposit';
+
+        if (!linkedAccountId) {
+          const nextAmount = isDeposit
+            ? addMoney(goal.currentAmount, safeAmount)
+            : Math.max(0, subMoney(goal.currentAmount, safeAmount));
+          get().updateGoal(goal.id, {
+            currentAmount: nextAmount,
+            isCompleted: nextAmount >= goal.targetAmount,
+          });
+          return null;
+        }
+
+        const txDate = date ?? new Date().toISOString().slice(0, 10);
 
         return get().addTransaction({
           userId: goal.userId,
           type: 'transfer',
           amount: safeAmount,
           currency: goal.currency,
-          accountId: isDeposit ? (accountId ?? '') : '',
-          toAccountId: isDeposit ? null : accountId || 'goal-withdraw',
+          accountId: isDeposit ? linkedAccountId : '',
+          toAccountId: isDeposit ? null : linkedAccountId,
           toAmount: isDeposit ? null : safeAmount,
           categoryId: null,
           goalId: goal.id,
@@ -1373,6 +1386,18 @@ export const useFinanceStore = create<FinanceStoreState>()(
           throw new Error('Borç/alacak kaydı bulunamadı.');
         }
 
+        const safeAmount = roundMoney(amount);
+        const linkedAccountId = accountId?.trim() || '';
+
+        if (!linkedAccountId) {
+          const nextPaid = Math.min(debt.totalAmount, addMoney(debt.paidAmount, safeAmount));
+          get().updateDebt(debt.id, {
+            paidAmount: nextPaid,
+            isSettled: nextPaid >= debt.totalAmount,
+          });
+          return null;
+        }
+
         const txType = debt.direction === 'owed_to_me' ? 'income' : 'expense';
         const targetCategoryName =
           debt.direction === 'owed_to_me' ? 'Alacak Tahsilatı' : 'Borç Ödeme';
@@ -1383,9 +1408,9 @@ export const useFinanceStore = create<FinanceStoreState>()(
         return get().addTransaction({
           userId: debt.userId,
           type: txType,
-          amount: roundMoney(amount),
+          amount: safeAmount,
           currency: debt.currency,
-          accountId: accountId ?? '',
+          accountId: linkedAccountId,
           categoryId: matchedCat?.id ?? null,
           debtId: debt.id,
           date: date ?? new Date().toISOString().slice(0, 10),

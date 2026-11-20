@@ -18,6 +18,7 @@ import {
   generateTransactionsCsv,
   parseBackupJson,
   sanitizeCsvCell,
+  sharePdfReport,
 } from '@/services/exportService';
 import { fetchLiveRates } from '@/services/fxService';
 import {
@@ -383,6 +384,63 @@ describe('Review Focus #5: Demo isolation, category deduplication & LWW sync', (
     expect(roundTrip.toAccountId).toBe('acc-2');
     expect(roundTrip.goalId).toBe('goal-1');
   });
+
+  it('adopts remote budget id when newer local active budget collides on (categoryId, month)', () => {
+    const remoteCat = makeCategory({
+      id: 'rem-market',
+      userId: 'user-1',
+      name: 'Market',
+      type: 'expense',
+    });
+    const localCat = makeCategory({
+      id: 'loc-market',
+      name: 'Market',
+      type: 'expense',
+    });
+
+    const remoteBudget: Budget = {
+      id: 'rem-budget-1',
+      userId: 'user-1',
+      categoryId: 'rem-market',
+      month: '2026-11',
+      limitAmount: 4_000,
+      currency: 'TRY',
+      alert80Sent: false,
+      alert100Sent: false,
+      createdAt: EARLIER,
+      updatedAt: EARLIER,
+      deletedAt: null,
+    };
+    const localBudget: Budget = {
+      id: 'loc-budget-1',
+      userId: null,
+      categoryId: 'loc-market',
+      month: '2026-11',
+      limitAmount: 7_500,
+      currency: 'TRY',
+      alert80Sent: false,
+      alert100Sent: false,
+      createdAt: NOW,
+      updatedAt: LATER,
+      deletedAt: null,
+    };
+
+    const { nextState, toUpload } = mergeLocalIntoCloud(
+      makeSnapshot({ categories: [localCat], budgets: [localBudget] }),
+      makeSnapshot({ categories: [remoteCat], budgets: [remoteBudget] }),
+      'merge',
+    );
+
+    const activeBudgets = nextState.budgets.filter((b) => b.deletedAt === null);
+    expect(activeBudgets).toHaveLength(1);
+    expect(activeBudgets[0].id).toBe('rem-budget-1');
+    expect(activeBudgets[0].categoryId).toBe('rem-market');
+    expect(activeBudgets[0].limitAmount).toBe(7_500);
+
+    expect(toUpload.budgets).toHaveLength(1);
+    expect(toUpload.budgets[0].id).toBe('rem-budget-1');
+    expect(toUpload.budgets[0].limitAmount).toBe(7_500);
+  });
 });
 
 describe('Live FX service', () => {
@@ -500,6 +558,100 @@ describe('JSON Backup, HTML Report & Store Integration', () => {
     expect(html).toContain('Toplam Gider');
     expect(html).not.toContain('Gizli Not');
     expect(html).not.toContain('<script>');
+  });
+
+  it('sharePdfReport prints report HTML via hidden iframe on Web without window.open noopener', async () => {
+    const cats = createDefaultCategories();
+    const snapshot = buildSharedReportSnapshot({
+      title: 'Web PDF Test Raporu',
+      periodType: 'monthly',
+      range: { startDate: '2026-11-01', endDate: '2026-11-30' },
+      prevRange: { startDate: '2026-10-01', endDate: '2026-10-31' },
+      transactions: [],
+      categories: cats,
+      budgets: [],
+      baseCurrency: 'TRY',
+      monthStartDay: 1,
+      rates: { TRY: 1, USD: 40, EUR: 44, GBP: 50, XAU: 3500 },
+      includeTransactions: false,
+      includeNotes: false,
+      generatedAt: NOW,
+    });
+
+    const prevWindow = globalThis.window;
+    const prevDocument = globalThis.document;
+
+    const framePrint = vi.fn();
+    const frameFocus = vi.fn();
+    const windowOpenSpy = vi.fn();
+    const windowPrintSpy = vi.fn();
+
+    const fakeIframe: {
+      style: Record<string, string>;
+      srcdoc: string;
+      onload: (() => void) | null;
+      parentNode: { removeChild: (el: unknown) => void } | null;
+      contentWindow: {
+        focus: () => void;
+        print: () => void;
+        addEventListener: (ev: string, cb: () => void) => void;
+      };
+      setAttribute: (k: string, v: string) => void;
+    } = {
+      style: {},
+      srcdoc: '',
+      onload: null,
+      parentNode: null,
+      contentWindow: {
+        focus: frameFocus,
+        print: framePrint,
+        addEventListener: vi.fn(),
+      },
+      setAttribute: vi.fn(),
+    };
+
+    const removeChild = vi.fn(() => {
+      fakeIframe.parentNode = null;
+    });
+    const appendChild = vi.fn(() => {
+      fakeIframe.parentNode = { removeChild };
+      fakeIframe.onload?.();
+    });
+
+    try {
+      Object.defineProperty(globalThis, 'window', {
+        configurable: true,
+        writable: true,
+        value: { open: windowOpenSpy, print: windowPrintSpy },
+      });
+      Object.defineProperty(globalThis, 'document', {
+        configurable: true,
+        writable: true,
+        value: {
+          createElement: vi.fn(() => fakeIframe),
+          body: { appendChild },
+        },
+      });
+
+      await sharePdfReport(snapshot);
+
+      expect(windowOpenSpy).not.toHaveBeenCalled();
+      expect(windowPrintSpy).not.toHaveBeenCalled();
+      expect(fakeIframe.srcdoc).toContain('Web PDF Test Raporu');
+      expect(frameFocus).toHaveBeenCalledTimes(1);
+      expect(framePrint).toHaveBeenCalledTimes(1);
+    } finally {
+      Object.defineProperty(globalThis, 'window', {
+        configurable: true,
+        writable: true,
+        value: prevWindow,
+      });
+      Object.defineProperty(globalThis, 'document', {
+        configurable: true,
+        writable: true,
+        value: prevDocument,
+      });
+    }
   });
 
   it('restoreFromBackup merge upserts while replace soft-deletes missing records for cloud tombstones', () => {
@@ -635,13 +787,77 @@ describe('JSON Backup, HTML Report & Store Integration', () => {
       note: 'Kumbaraya aktarım',
     });
 
-    expect(tx.type).toBe('transfer');
-    expect(tx.goalId).toBe(goal.id);
-    expect(tx.toAccountId).toBeNull();
+    expect(tx).not.toBeNull();
+    expect(tx!.type).toBe('transfer');
+    expect(tx!.goalId).toBe(goal.id);
+    expect(tx!.toAccountId).toBeNull();
     expect(useFinanceStore.getState().savingsGoals[0].currentAmount).toBe(2_000);
 
-    store.deleteTransaction(tx.id);
+    store.deleteTransaction(tx!.id);
     expect(useFinanceStore.getState().savingsGoals[0].currentAmount).toBe(0);
+  });
+
+  it('contributeToGoal handles accountless updates directly and syncs withdrawal with nullable account_id', () => {
+    const store = useFinanceStore.getState();
+    const bank = store.addAccount({
+      name: 'Banka',
+      type: 'bank',
+      currency: 'TRY',
+      initialBalance: 10_000,
+      color: '#3B82F6',
+      icon: 'landmark',
+      isArchived: false,
+    });
+    const goal = store.addGoal({
+      name: 'Acil Fon',
+      targetAmount: 3_000,
+      currentAmount: 0,
+      currency: 'TRY',
+      icon: 'shield',
+      color: '#10B981',
+    });
+
+    // Accountless deposit/withdraw updates goal directly without creating fake accountless transactions
+    const directDeposit = store.contributeToGoal({
+      goalId: goal.id,
+      amount: 3_000,
+      direction: 'deposit',
+    });
+    expect(directDeposit).toBeNull();
+    expect(useFinanceStore.getState().transactions).toHaveLength(0);
+    expect(useFinanceStore.getState().savingsGoals[0].currentAmount).toBe(3_000);
+    expect(useFinanceStore.getState().savingsGoals[0].isCompleted).toBe(true);
+
+    const directWithdraw = store.contributeToGoal({
+      goalId: goal.id,
+      amount: 500,
+      direction: 'withdraw',
+    });
+    expect(directWithdraw).toBeNull();
+    expect(useFinanceStore.getState().transactions).toHaveLength(0);
+    expect(useFinanceStore.getState().savingsGoals[0].currentAmount).toBe(2_500);
+    expect(useFinanceStore.getState().savingsGoals[0].isCompleted).toBe(false);
+
+    // Withdrawal linked to a target account creates transfer with accountId='' -> null in Postgres
+    const withdrawTx = store.contributeToGoal({
+      goalId: goal.id,
+      amount: 1_000,
+      accountId: bank.id,
+      direction: 'withdraw',
+      date: '2026-11-20',
+    });
+    expect(withdrawTx).not.toBeNull();
+    expect(withdrawTx!.accountId).toBe('');
+    expect(withdrawTx!.toAccountId).toBe(bank.id);
+    expect(useFinanceStore.getState().savingsGoals[0].currentAmount).toBe(1_500);
+
+    const snake = toSnakeRow('transactions', withdrawTx!, 'user-1');
+    expect(snake.account_id).toBeNull();
+    expect(snake.to_account_id).toBe(bank.id);
+
+    const parsed = fromSnakeRow('transactions', snake) as Transaction;
+    expect(parsed.accountId).toBe('');
+    expect(parsed.toAccountId).toBe(bank.id);
   });
 
   it('recordDebtPayment updates debt.paidAmount and deleting linked tx reverts paidAmount', () => {
@@ -663,6 +879,14 @@ describe('JSON Backup, HTML Report & Store Integration', () => {
       currency: 'TRY',
     });
 
+    const directPayment = store.recordDebtPayment({
+      debtId: debt.id,
+      amount: 500,
+    });
+    expect(directPayment).toBeNull();
+    expect(useFinanceStore.getState().transactions).toHaveLength(0);
+    expect(useFinanceStore.getState().debts[0].paidAmount).toBe(500);
+
     const paymentTx = store.recordDebtPayment({
       debtId: debt.id,
       amount: 1_500,
@@ -670,12 +894,13 @@ describe('JSON Backup, HTML Report & Store Integration', () => {
       date: '2026-11-20',
     });
 
-    expect(paymentTx.type).toBe('income');
-    expect(paymentTx.debtId).toBe(debt.id);
-    expect(useFinanceStore.getState().debts[0].paidAmount).toBe(1_500);
+    expect(paymentTx).not.toBeNull();
+    expect(paymentTx!.type).toBe('income');
+    expect(paymentTx!.debtId).toBe(debt.id);
+    expect(useFinanceStore.getState().debts[0].paidAmount).toBe(2_000);
 
-    store.deleteTransaction(paymentTx.id);
-    expect(useFinanceStore.getState().debts[0].paidAmount).toBe(0);
+    store.deleteTransaction(paymentTx!.id);
+    expect(useFinanceStore.getState().debts[0].paidAmount).toBe(500);
   });
 
   it('copyPreviousMonthBudgets copies prior month limits cleanly with reset alert flags', () => {

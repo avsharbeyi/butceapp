@@ -126,6 +126,16 @@ export function mergeLwwEntities<T extends { id: string; updatedAt: string }>(
 
 function mergeBudgetsDeduplicated(local: Budget[], remote: Budget[]): Budget[] {
   const lwwMerged = mergeLwwEntities(local, remote);
+  const remoteActiveIdByKey = new Map<string, string>();
+  for (const budget of remote) {
+    if (budget.deletedAt === null) {
+      const key = `${budget.categoryId ?? 'general'}|${budget.month}`;
+      if (!remoteActiveIdByKey.has(key)) {
+        remoteActiveIdByKey.set(key, budget.id);
+      }
+    }
+  }
+
   const activeByKey = new Map<string, Budget>();
   const tombstones: Budget[] = [];
 
@@ -136,11 +146,14 @@ function mergeBudgetsDeduplicated(local: Budget[], remote: Budget[]): Budget[] {
     }
     const key = `${budget.categoryId ?? 'general'}|${budget.month}`;
     const existing = activeByKey.get(key);
-    if (!existing) {
-      activeByKey.set(key, budget);
-    } else {
-      activeByKey.set(key, pickNewerLww(budget, existing));
-    }
+    const winner = existing ? pickNewerLww(budget, existing) : budget;
+    const canonicalRemoteId = remoteActiveIdByKey.get(key);
+    activeByKey.set(
+      key,
+      canonicalRemoteId && winner.id !== canonicalRemoteId
+        ? { ...winner, id: canonicalRemoteId }
+        : winner,
+    );
   }
 
   return [...Array.from(activeByKey.values()), ...tombstones];
@@ -437,8 +450,8 @@ export function toSnakeTransactionRow(tx: Transaction, userId: string): SnakeRow
     currency: tx.currency,
     exchange_rate_to_base: tx.exchangeRateToBase,
     base_amount: tx.baseAmount,
-    account_id: tx.accountId,
-    to_account_id: tx.toAccountId ?? null,
+    account_id: tx.accountId ? tx.accountId : null,
+    to_account_id: tx.toAccountId ? tx.toAccountId : null,
     to_amount: tx.toAmount ?? null,
     category_id: tx.categoryId ?? null,
     date: tx.date,
@@ -465,7 +478,7 @@ export function fromSnakeTransactionRow(row: SnakeRow): Transaction {
     currency: asString(row.currency, 'TRY') as CurrencyCode,
     exchangeRateToBase: asNumber(row.exchange_rate_to_base, 1),
     baseAmount: asNumber(row.base_amount),
-    accountId: asString(row.account_id),
+    accountId: asNullableString(row.account_id) ?? '',
     toAccountId: asNullableString(row.to_account_id),
     toAmount: asNullableNumber(row.to_amount),
     categoryId: asNullableString(row.category_id),

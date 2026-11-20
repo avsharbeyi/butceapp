@@ -40,6 +40,12 @@ describe('Supabase schema, environment config, and Expo configuration', () => {
     expect(schema).toMatch(
       /CREATE\s+UNIQUE\s+INDEX[\s\S]*?ON\s+public\.budgets[\s\S]*?WHERE\s+deleted_at\s+IS\s+NULL/i,
     );
+    expect(schema).toMatch(
+      /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+public\.transactions[\s\S]*?account_id\s+uuid\s+REFERENCES\s+public\.accounts\(id\)/i,
+    );
+    expect(schema).toMatch(
+      /CHECK\s*\(\s*account_id\s+IS\s+NOT\s+NULL\s+OR\s+to_account_id\s+IS\s+NOT\s+NULL\s*\)/i,
+    );
   });
 
   it('enables RLS and defines SELECT/INSERT/UPDATE/DELETE owner policies on every table', () => {
