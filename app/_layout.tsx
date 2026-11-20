@@ -152,7 +152,7 @@ function RootShell() {
 
   const [isLocked, setIsLocked] = useState(false);
   const startupDoneRef = useRef(false);
-  const appStateRef = useRef<string>(AppState.currentState ?? 'active');
+  const wasBackgroundRef = useRef(AppState.currentState === 'background');
 
   const isSharedRoute = pathname === '/shared' || pathname.startsWith('/shared/');
 
@@ -199,10 +199,13 @@ function RootShell() {
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (nextState) => {
-      const prevState = appStateRef.current;
-      appStateRef.current = nextState;
+      if (nextState === 'background') {
+        wasBackgroundRef.current = true;
+        return;
+      }
 
-      if (prevState === 'background' && nextState === 'active') {
+      if (nextState === 'active' && wasBackgroundRef.current) {
+        wasBackgroundRef.current = false;
         if (useFinanceStore.getState().settings.appLockEnabled) {
           void hasPin()
             .then((pinExists) => {

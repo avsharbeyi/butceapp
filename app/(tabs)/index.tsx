@@ -35,7 +35,7 @@ import {
   computeEndOfMonthForecast,
   computePeriodKPIs,
 } from '@/domain/analytics';
-import { ratesListToMap } from '@/domain/currency';
+import { convertAmount, ratesListToMap } from '@/domain/currency';
 import {
   computeAccountBalance,
   computeCreditCardSummary,
@@ -214,8 +214,22 @@ export default function DashboardScreen() {
       return null;
     }
 
-    const totalLimit = categoryItems.reduce((sum, item) => addMoney(sum, item.limit), 0);
-    const totalSpent = categoryItems.reduce((sum, item) => addMoney(sum, item.spent), 0);
+    const totalLimit = categoryItems.reduce(
+      (sum, item) =>
+        addMoney(
+          sum,
+          convertAmount(item.limit, item.budget.currency, settings.baseCurrency, ratesMap),
+        ),
+      0,
+    );
+    const totalSpent = categoryItems.reduce(
+      (sum, item) =>
+        addMoney(
+          sum,
+          convertAmount(item.spent, item.budget.currency, settings.baseCurrency, ratesMap),
+        ),
+      0,
+    );
     const pct = totalLimit > 0 ? Math.round((totalSpent / totalLimit) * 1000) / 10 : 0;
     return {
       label: 'Kategori Bütçeleri Toplamı',
@@ -224,7 +238,7 @@ export default function DashboardScreen() {
       pct,
       currency: settings.baseCurrency,
     };
-  }, [budgetProgress, settings.baseCurrency]);
+  }, [budgetProgress, settings.baseCurrency, ratesMap]);
 
   const topCategoryBudgets = useMemo(
     () =>
