@@ -1,3 +1,4 @@
+import { createDefaultCategories } from '@/domain/defaults';
 import type {
   Account,
   Budget,
@@ -203,14 +204,47 @@ function remapCategoryId(
   return idRemap[categoryId] ?? categoryId;
 }
 
+/** Returns true if the local snapshot contains non-demo user-created records. */
+export function hasNonDemoLocalData(snapshot: FinanceDataSnapshot): boolean {
+  const hasReal = <T extends { deletedAt: string | null; isDemo?: boolean }>(items: T[]) =>
+    items.some((item) => item.deletedAt === null && item.isDemo !== true);
+
+  return (
+    hasReal(snapshot.accounts) ||
+    hasReal(snapshot.transactions) ||
+    hasReal(snapshot.installmentPlans) ||
+    hasReal(snapshot.recurringRules) ||
+    hasReal(snapshot.budgets) ||
+    hasReal(snapshot.savingsGoals) ||
+    hasReal(snapshot.debts) ||
+    snapshot.categories.some(
+      (c) => c.deletedAt === null && !c.isDefault && c.isDemo !== true,
+    )
+  );
+}
+
+function ensureActiveDefaultCategories(
+  categories: Category[],
+  userId: string | null,
+): Category[] {
+  if (categories.some((c) => c.deletedAt === null)) {
+    return categories;
+  }
+  const defaults = createDefaultCategories(userId);
+  const existingById = new Set(categories.map((c) => c.id));
+  return [...categories, ...defaults.filter((d) => !existingById.has(d.id))];
+}
+
 /**
  * Merges local data into remote cloud state while isolating demo records (`isDemo: true`),
- * deduplicating categories by `name + type`, and remapping local real foreign keys.
+ * deduplicating categories by `name + type`, seeding default categories when none exist,
+ * and dropping orphaned local foreign keys.
  */
 export function mergeLocalIntoCloud(
   localState: FinanceDataSnapshot,
   remoteState: FinanceDataSnapshot,
   mode: 'merge' | 'cloud_only',
+  remoteUserId?: string | null,
 ): { nextState: FinanceDataSnapshot; toUpload: FinanceDataSnapshot } {
   const cleanRemote: FinanceDataSnapshot = {
     accounts: stripDemo(remoteState.accounts),
@@ -225,9 +259,23 @@ export function mergeLocalIntoCloud(
     settings: remoteState.settings,
   };
 
+  const resolvedRemoteUserId =
+    remoteUserId ??
+    cleanRemote.accounts.find((a) => a.userId)?.userId ??
+    cleanRemote.categories.find((c) => c.userId)?.userId ??
+    cleanRemote.transactions.find((t) => t.userId)?.userId ??
+    null;
+
   if (mode === 'cloud_only') {
+    const cloudCategories = ensureActiveDefaultCategories(
+      cleanRemote.categories,
+      resolvedRemoteUserId,
+    );
     return {
-      nextState: cleanRemote,
+      nextState: {
+        ...cleanRemote,
+        categories: cloudCategories,
+      },
       toUpload: {
         accounts: [],
         categories: [],
@@ -256,38 +304,87 @@ export function mergeLocalIntoCloud(
     settings: localState.settings,
   };
 
-  const { merged: categories, idRemap } = deduplicateCategoriesByNameType(
+  const { merged: dedupedCategories, idRemap } = deduplicateCategoriesByNameType(
     cleanLocal.categories,
     cleanRemote.categories,
   );
-
-  const remappedLocalTransactions = cleanLocal.transactions.map((tx) => ({
-    ...tx,
-    categoryId: remapCategoryId(tx.categoryId, idRemap),
-  }));
-
-  const remappedLocalBudgets = cleanLocal.budgets.map((budget) => ({
-    ...budget,
-    categoryId: remapCategoryId(budget.categoryId, idRemap),
-  }));
-
-  const remappedLocalPlans = cleanLocal.installmentPlans.map((plan) => ({
-    ...plan,
-    categoryId: remapCategoryId(plan.categoryId, idRemap) ?? plan.categoryId,
-  }));
-
-  const remappedLocalRules = cleanLocal.recurringRules.map((rule) => ({
-    ...rule,
-    categoryId: remapCategoryId(rule.categoryId, idRemap) ?? rule.categoryId,
-  }));
+  const categories = ensureActiveDefaultCategories(dedupedCategories, resolvedRemoteUserId);
 
   const accounts = mergeLwwEntities(cleanLocal.accounts, cleanRemote.accounts);
-  const transactions = mergeLwwEntities(remappedLocalTransactions, cleanRemote.transactions);
+  const savingsGoals = mergeLwwEntities(cleanLocal.savingsGoals, cleanRemote.savingsGoals);
+  const debts = mergeLwwEntities(cleanLocal.debts, cleanRemote.debts);
+
+  const validAccountIds = new Set(accounts.map((a) => a.id));
+  const validCategoryIds = new Set(categories.map((c) => c.id));
+  const validGoalIds = new Set(savingsGoals.map((g) => g.id));
+  const validDebtIds = new Set(debts.map((d) => d.id));
+
+  const remappedLocalPlans = cleanLocal.installmentPlans
+    .map((plan) => ({
+      ...plan,
+      categoryId: remapCategoryId(plan.categoryId, idRemap) ?? plan.categoryId,
+    }))
+    .filter(
+      (plan) => validAccountIds.has(plan.accountId) && validCategoryIds.has(plan.categoryId),
+    );
+
+  const remappedLocalRules = cleanLocal.recurringRules
+    .map((rule) => ({
+      ...rule,
+      categoryId: remapCategoryId(rule.categoryId, idRemap) ?? rule.categoryId,
+    }))
+    .filter(
+      (rule) => validAccountIds.has(rule.accountId) && validCategoryIds.has(rule.categoryId),
+    );
+
+  const remappedLocalBudgets = cleanLocal.budgets
+    .map((budget) => ({
+      ...budget,
+      categoryId: remapCategoryId(budget.categoryId, idRemap),
+    }))
+    .filter((budget) => budget.categoryId === null || validCategoryIds.has(budget.categoryId));
+
   const installmentPlans = mergeLwwEntities(remappedLocalPlans, cleanRemote.installmentPlans);
   const recurringRules = mergeLwwEntities(remappedLocalRules, cleanRemote.recurringRules);
   const budgets = mergeBudgetsDeduplicated(remappedLocalBudgets, cleanRemote.budgets);
-  const savingsGoals = mergeLwwEntities(cleanLocal.savingsGoals, cleanRemote.savingsGoals);
-  const debts = mergeLwwEntities(cleanLocal.debts, cleanRemote.debts);
+
+  const validPlanIds = new Set(installmentPlans.map((p) => p.id));
+  const validRuleIds = new Set(recurringRules.map((r) => r.id));
+
+  const remappedLocalTransactions = cleanLocal.transactions
+    .map((tx) => ({
+      ...tx,
+      categoryId: remapCategoryId(tx.categoryId, idRemap),
+    }))
+    .filter((tx) => {
+      if (!tx.accountId && !tx.toAccountId) {
+        return false;
+      }
+      if (tx.accountId && !validAccountIds.has(tx.accountId)) {
+        return false;
+      }
+      if (tx.toAccountId && !validAccountIds.has(tx.toAccountId)) {
+        return false;
+      }
+      if (tx.categoryId && !validCategoryIds.has(tx.categoryId)) {
+        return false;
+      }
+      if (tx.installmentPlanId && !validPlanIds.has(tx.installmentPlanId)) {
+        return false;
+      }
+      if (tx.recurringRuleId && !validRuleIds.has(tx.recurringRuleId)) {
+        return false;
+      }
+      if (tx.goalId && !validGoalIds.has(tx.goalId)) {
+        return false;
+      }
+      if (tx.debtId && !validDebtIds.has(tx.debtId)) {
+        return false;
+      }
+      return true;
+    });
+
+  const transactions = mergeLwwEntities(remappedLocalTransactions, cleanRemote.transactions);
   const exchangeRates = mergeExchangeRates(cleanLocal.exchangeRates, cleanRemote.exchangeRates);
 
   const nextState: FinanceDataSnapshot = {

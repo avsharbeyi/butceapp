@@ -46,18 +46,13 @@ import {
   addDays,
   getFiscalMonthKey,
   getFiscalMonthRange,
+  getLocalTodayIso,
   getPreviousPeriodRange,
   parseIsoDate,
-  toIsoDate,
 } from '@/domain/periods';
 import type { AccountType, Transaction } from '@/domain/types';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { TABULAR_NUMS_STYLE, useResponsiveLayout, useTheme } from '@/theme/theme';
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
 
 function formatShortTrDate(isoDate: string): string {
   try {
@@ -292,7 +287,7 @@ export default function DashboardScreen() {
 
     for (const acc of activeAccounts) {
       if (acc.type !== 'credit_card') continue;
-      const cc = computeCreditCardSummary(acc, transactions, todayIso);
+      const cc = computeCreditCardSummary(acc, transactions, todayIso, ratesMap);
       if (cc.nextDueDate >= todayIso && cc.nextDueDate <= endIso && cc.totalDebt > 0) {
         items.push({
           id: `cc-${acc.id}`,
@@ -334,16 +329,24 @@ export default function DashboardScreen() {
     }
 
     return items.sort((a, b) => a.date.localeCompare(b.date));
-  }, [recurringRules, activeAccounts, transactions, debts, todayIso, settings.baseCurrency]);
+  }, [
+    recurringRules,
+    activeAccounts,
+    transactions,
+    debts,
+    todayIso,
+    ratesMap,
+    settings.baseCurrency,
+  ]);
 
   const recentTransactions = useMemo(
     () =>
       transactions
-        .filter((t) => t.deletedAt === null)
+        .filter((t) => t.deletedAt === null && t.date <= todayIso)
         .slice()
         .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt))
         .slice(0, 5),
-    [transactions],
+    [transactions, todayIso],
   );
 
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
@@ -694,9 +697,9 @@ export default function DashboardScreen() {
               {activeAccounts.map((acc) => {
                 const isCard = acc.type === 'credit_card';
                 const cardSummary = isCard
-                  ? computeCreditCardSummary(acc, transactions, todayIso)
+                  ? computeCreditCardSummary(acc, transactions, todayIso, ratesMap)
                   : null;
-                const balance = computeAccountBalance(acc, transactions, todayIso);
+                const balance = computeAccountBalance(acc, transactions, todayIso, ratesMap);
                 const limit = acc.creditLimit ?? 0;
                 const usedPct =
                   isCard && cardSummary && limit > 0

@@ -89,6 +89,21 @@ function resolveCreditCardCycle(
   return { statementStart, statementEnd, nextDueDate };
 }
 
+function resolveTxAccountAmount(
+  tx: Transaction,
+  accountCurrency: CurrencyCode,
+  rates?: Record<CurrencyCode, number>,
+  isIncomingTransfer = false,
+): number {
+  if (isIncomingTransfer && tx.toAmount != null) {
+    return tx.toAmount;
+  }
+  if (rates && tx.currency !== accountCurrency) {
+    return convertAmount(tx.amount, tx.currency, accountCurrency, rates);
+  }
+  return tx.amount;
+}
+
 /**
  * Computes credit card debt metrics (`totalDebt` including unmatured installments,
  * `maturedDebt`, `availableLimit`, `statementDue`, and statement cycle dates) as of `asOfDate`.
@@ -97,6 +112,7 @@ export function computeCreditCardSummary(
   account: Account,
   transactions: Transaction[],
   asOfDate: string,
+  rates?: Record<CurrencyCode, number>,
 ): CreditCardSummary {
   const statementDay = clampDayOfMonth(account.statementDay, 1);
   const dueDay = clampDayOfMonth(account.dueDay, 10);
@@ -120,7 +136,7 @@ export function computeCreditCardSummary(
     const isCharge =
       (tx.type === 'expense' || tx.type === 'transfer') && tx.accountId === account.id;
     if (isCharge) {
-      const amtKurus = toKurus(tx.amount);
+      const amtKurus = toKurus(resolveTxAccountAmount(tx, account.currency, rates));
       totalDeltaKurus += amtKurus;
       if (tx.date <= asOfDate) {
         maturedDeltaKurus += amtKurus;
@@ -132,9 +148,9 @@ export function computeCreditCardSummary(
 
     let creditKurus = 0;
     if (tx.type === 'transfer' && tx.toAccountId === account.id) {
-      creditKurus = toKurus(tx.toAmount ?? tx.amount);
+      creditKurus = toKurus(resolveTxAccountAmount(tx, account.currency, rates, true));
     } else if (tx.type === 'income' && tx.accountId === account.id) {
-      creditKurus = toKurus(tx.amount);
+      creditKurus = toKurus(resolveTxAccountAmount(tx, account.currency, rates));
     }
 
     if (creditKurus !== 0) {
@@ -175,9 +191,10 @@ export function computeAccountBalance(
   account: Account,
   transactions: Transaction[],
   asOfDate: string,
+  rates?: Record<CurrencyCode, number>,
 ): number {
   if (account.type === 'credit_card') {
-    const { totalDebt } = computeCreditCardSummary(account, transactions, asOfDate);
+    const { totalDebt } = computeCreditCardSummary(account, transactions, asOfDate, rates);
     return totalDebt === 0 ? 0 : -totalDebt;
   }
 
@@ -189,15 +206,15 @@ export function computeAccountBalance(
     }
 
     if (tx.type === 'income' && tx.accountId === account.id) {
-      kurus += toKurus(tx.amount);
+      kurus += toKurus(resolveTxAccountAmount(tx, account.currency, rates));
     } else if (tx.type === 'expense' && tx.accountId === account.id) {
-      kurus -= toKurus(tx.amount);
+      kurus -= toKurus(resolveTxAccountAmount(tx, account.currency, rates));
     } else if (tx.type === 'transfer') {
       if (tx.accountId === account.id) {
-        kurus -= toKurus(tx.amount);
+        kurus -= toKurus(resolveTxAccountAmount(tx, account.currency, rates));
       }
       if (tx.toAccountId === account.id) {
-        kurus += toKurus(tx.toAmount ?? tx.amount);
+        kurus += toKurus(resolveTxAccountAmount(tx, account.currency, rates, true));
       }
     }
   }
@@ -229,11 +246,11 @@ export function computeNetWorth(params: {
     }
 
     if (acc.type === 'credit_card') {
-      const { totalDebt } = computeCreditCardSummary(acc, transactions, asOfDate);
+      const { totalDebt } = computeCreditCardSummary(acc, transactions, asOfDate, rates);
       const convertedDebt = convertAmount(totalDebt, acc.currency, baseCurrency, rates);
       totalCardDebt = addMoney(totalCardDebt, convertedDebt);
     } else {
-      const balance = computeAccountBalance(acc, transactions, asOfDate);
+      const balance = computeAccountBalance(acc, transactions, asOfDate, rates);
       const convertedBalance = convertAmount(balance, acc.currency, baseCurrency, rates);
       totalAssets = addMoney(totalAssets, convertedBalance);
     }
@@ -324,12 +341,13 @@ export function buildInstallmentTransactions(
 
 /**
  * Deterministically recomputes a savings goal's `currentAmount` from active linked transfers.
- * Deposits (`!toAccountId`) add `amount`; withdrawals (`!!toAccountId`) subtract `amount`.
+ * Deposits (`!toAccountId`) add the goal-currency amount; withdrawals (`!!toAccountId`) subtract it.
  */
 export function recomputeGoalAmount(
   goal: SavingsGoal,
   transactions: Transaction[],
   baseManualOffset = 0,
+  rates?: Record<CurrencyCode, number>,
 ): number {
   let deltaKurus = 0;
 
@@ -337,10 +355,22 @@ export function recomputeGoalAmount(
     if (tx.deletedAt !== null || tx.type !== 'transfer' || tx.goalId !== goal.id) {
       continue;
     }
-    if (!tx.toAccountId) {
-      deltaKurus += toKurus(tx.amount);
+    const isDeposit = !tx.toAccountId;
+    let goalAmount: number;
+    if (tx.currency === goal.currency) {
+      goalAmount = tx.amount;
+    } else if (isDeposit && tx.toAmount != null) {
+      goalAmount = tx.toAmount;
+    } else if (rates) {
+      goalAmount = convertAmount(tx.amount, tx.currency, goal.currency, rates);
     } else {
-      deltaKurus -= toKurus(tx.amount);
+      goalAmount = tx.toAmount ?? tx.amount;
+    }
+
+    if (isDeposit) {
+      deltaKurus += toKurus(goalAmount);
+    } else {
+      deltaKurus -= toKurus(goalAmount);
     }
   }
 
@@ -355,6 +385,7 @@ export function recomputeDebtPaidAmount(
   debt: Debt,
   transactions: Transaction[],
   baseManualOffset = 0,
+  rates?: Record<CurrencyCode, number>,
 ): number {
   let paidKurus = toKurus(baseManualOffset);
 
@@ -362,7 +393,11 @@ export function recomputeDebtPaidAmount(
     if (tx.deletedAt !== null || tx.debtId !== debt.id) {
       continue;
     }
-    paidKurus += toKurus(tx.amount);
+    const debtAmount =
+      rates && tx.currency !== debt.currency
+        ? convertAmount(tx.amount, tx.currency, debt.currency, rates)
+        : tx.amount;
+    paidKurus += toKurus(debtAmount);
   }
 
   const maxKurus = Math.max(0, toKurus(debt.totalAmount));

@@ -344,6 +344,9 @@ describe('sharedReportService', () => {
     expect(noNotes.expiresAt).toBeNull();
     expect(noNotes.snapshotJson.transactions).toHaveLength(1);
     expect(noNotes.snapshotJson.transactions[0].note).toBeUndefined();
+    expect(noNotes.snapshotJson.transactions[0].tags).toBeUndefined();
+    expect('note' in noNotes.snapshotJson.transactions[0]).toBe(false);
+    expect('tags' in noNotes.snapshotJson.transactions[0]).toBe(false);
 
     const fetchedFuture = await fetchPublicSharedReport(
       noNotes.shareToken,
@@ -449,5 +452,327 @@ describe('notificationService', () => {
 
     expect(createDefaultExchangeRates().length).toBe(5);
     await expect(scheduleUpcomingReminders([sampleRule], [sampleAccount])).resolves.toBeUndefined();
+  });
+});
+
+describe('Supabase RPC error propagation, budget tombstone ordering, startup sync & receipt storage', () => {
+  const originalUrl = process.env.EXPO_PUBLIC_SUPABASE_URL;
+  const originalAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
+
+  afterEach(() => {
+    vi.doUnmock('@supabase/supabase-js');
+    vi.resetModules();
+    if (originalUrl !== undefined) {
+      process.env.EXPO_PUBLIC_SUPABASE_URL = originalUrl;
+    } else {
+      delete process.env.EXPO_PUBLIC_SUPABASE_URL;
+    }
+    if (originalAnonKey !== undefined) {
+      process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY = originalAnonKey;
+    } else {
+      delete process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
+    }
+  });
+
+  it('throws on Supabase RPC errors in fetchPublicSharedReport instead of returning not_found', async () => {
+    vi.resetModules();
+    process.env.EXPO_PUBLIC_SUPABASE_URL = 'https://example.supabase.co';
+    process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY = 'example-anon-key';
+
+    const rpcMock = vi.fn(async () => ({
+      data: null,
+      error: { message: 'Sunucu ağ zaman aşımı' },
+    }));
+
+    vi.doMock('@supabase/supabase-js', () => ({
+      createClient: () => ({
+        auth: {
+          getSession: async () => ({ data: { session: null }, error: null }),
+        },
+        rpc: rpcMock,
+      }),
+    }));
+
+    const { fetchPublicSharedReport: freshFetchPublicSharedReport } = await import(
+      '@/services/sharedReportService'
+    );
+    await expect(freshFetchPublicSharedReport('some-token-123')).rejects.toThrow(
+      'Sunucu ağ zaman aşımı',
+    );
+    expect(rpcMock).toHaveBeenCalledWith('get_shared_report', { p_token: 'some-token-123' });
+  });
+
+  it('upserts budget tombstones before active budgets, uploads local receipts, resolves signed URLs, and handles startup/resume auto-sync', async () => {
+    vi.resetModules();
+    process.env.EXPO_PUBLIC_SUPABASE_URL = 'https://example.supabase.co';
+    process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY = 'example-anon-key';
+
+    const budgetUpsertBatches: Array<Array<{ id: string; deleted_at: string | null }>> = [];
+    const uploadedReceipts: Array<{ path: string; size: number; upsert: boolean }> = [];
+    const storedTransactionRows: Array<Record<string, unknown>> = [];
+
+    const mockClient = {
+      auth: {
+        getSession: async () => ({
+          data: { session: { user: { id: 'user-1', email: 'test@example.com' } } },
+          error: null,
+        }),
+      },
+      storage: {
+        from: () => ({
+          upload: async (path: string, bytes: Uint8Array, opts: { upsert: boolean }) => {
+            uploadedReceipts.push({ path, size: bytes.byteLength, upsert: opts.upsert });
+            return { data: { path }, error: null };
+          },
+          createSignedUrl: async (path: string) => ({
+            data: { signedUrl: `https://example.supabase.co/storage/v1/object/sign/receipts/${path}?token=abc` },
+            error: null,
+          }),
+        }),
+      },
+      from: (table: string) => ({
+        select: () => {
+          const chain: {
+            eq: () => typeof chain;
+            is: () => typeof chain;
+            maybeSingle: () => Promise<{ data: null; error: null }>;
+            then: (resolve: (val: { data: unknown[]; error: null }) => void) => void;
+          } = {
+            eq: () => chain,
+            is: () => chain,
+            maybeSingle: async () => ({ data: null, error: null }),
+            then: (resolve) => {
+              if (table === 'transactions') {
+                resolve({
+                  data: [
+                    {
+                      id: 'tx-remote-receipt',
+                      user_id: 'user-1',
+                      type: 'expense',
+                      amount: 100,
+                      currency: 'TRY',
+                      exchange_rate_to_base: 1,
+                      base_amount: 100,
+                      account_id: 'acc-1',
+                      to_account_id: null,
+                      to_amount: null,
+                      category_id: null,
+                      date: '2026-11-20',
+                      note: null,
+                      tags: [],
+                      receipt_uri: 'user-1/tx-remote-receipt.jpg',
+                      installment_plan_id: null,
+                      installment_number: null,
+                      recurring_rule_id: null,
+                      debt_id: null,
+                      goal_id: null,
+                      created_at: '2026-11-20T10:00:00.000Z',
+                      updated_at: '2026-11-20T10:00:00.000Z',
+                      deleted_at: null,
+                    },
+                  ],
+                  error: null,
+                });
+                return;
+              }
+              resolve({ data: [], error: null });
+            },
+          };
+          return chain;
+        },
+        upsert: async (rows: Array<Record<string, unknown>>) => {
+          if (table === 'budgets') {
+            budgetUpsertBatches.push(
+              rows.map((r) => ({
+                id: String(r.id),
+                deleted_at: (r.deleted_at as string | null) ?? null,
+              })),
+            );
+          }
+          if (table === 'transactions') {
+            storedTransactionRows.push(...rows);
+          }
+          return { error: null };
+        },
+        insert: async () => ({ error: null }),
+        update: () => ({ eq: async () => ({ error: null }) }),
+      }),
+    };
+
+    vi.doMock('@supabase/supabase-js', () => ({
+      createClient: () => mockClient,
+    }));
+
+    const {
+      fetchRemoteFinanceData: freshFetchRemote,
+      pushFinanceDataToCloud: freshPush,
+      syncSessionIfEligible: freshSyncSession,
+    } = await import('@/services/authService');
+    const { createDefaultCategories: freshDefaults } = await import('@/domain/defaults');
+
+    // 1. Verify fetchRemoteFinanceData resolves storage paths via createSignedUrl
+    const remote = await freshFetchRemote('user-1');
+    expect(remote.transactions[0].receiptUri).toContain(
+      'sign/receipts/user-1/tx-remote-receipt.jpg?token=abc',
+    );
+
+    // 2. Verify pushFinanceDataToCloud orders budget tombstones first and uploads local receipt data URIs
+    await freshPush('user-1', {
+      accounts: [],
+      categories: freshDefaults('user-1'),
+      installmentPlans: [],
+      recurringRules: [],
+      savingsGoals: [],
+      debts: [],
+      exchangeRates: [],
+      settings: {
+        baseCurrency: 'TRY',
+        theme: 'system',
+        privacyMode: false,
+        appLockEnabled: false,
+        notificationsEnabled: true,
+        monthStartDay: 1,
+      },
+      budgets: [
+        {
+          id: 'b-active',
+          userId: 'user-1',
+          categoryId: null,
+          month: '2026-11',
+          limitAmount: 5_000,
+          currency: 'TRY',
+          alert80Sent: false,
+          alert100Sent: false,
+          createdAt: '2026-11-20T10:00:00.000Z',
+          updatedAt: '2026-11-20T12:00:00.000Z',
+          deletedAt: null,
+        },
+        {
+          id: 'b-tombstone',
+          userId: 'user-1',
+          categoryId: null,
+          month: '2026-11',
+          limitAmount: 4_000,
+          currency: 'TRY',
+          alert80Sent: false,
+          alert100Sent: false,
+          createdAt: '2026-11-20T10:00:00.000Z',
+          updatedAt: '2026-11-20T11:00:00.000Z',
+          deletedAt: '2026-11-20T11:00:00.000Z',
+        },
+      ],
+      transactions: [
+        {
+          id: 'tx-with-receipt',
+          userId: 'user-1',
+          type: 'expense',
+          amount: 50,
+          currency: 'TRY',
+          exchangeRateToBase: 1,
+          baseAmount: 50,
+          accountId: 'acc-1',
+          date: '2026-11-20',
+          tags: [],
+          receiptUri: 'data:image/jpeg;base64,/9j/4AAQ',
+          createdAt: '2026-11-20T10:00:00.000Z',
+          updatedAt: '2026-11-20T10:00:00.000Z',
+          deletedAt: null,
+        },
+      ],
+    });
+
+    expect(budgetUpsertBatches).toHaveLength(2);
+    expect(budgetUpsertBatches[0][0].id).toBe('b-tombstone');
+    expect(budgetUpsertBatches[1][0].id).toBe('b-active');
+    expect(uploadedReceipts).toEqual([
+      { path: 'user-1/tx-with-receipt.jpg', size: 6, upsert: true },
+    ]);
+    expect(storedTransactionRows[0].receipt_uri).toBe('user-1/tx-with-receipt.jpg');
+
+    // 3. Verify syncSessionIfEligible defers when lastSyncedAt===null & non-demo local data exists,
+    //    and runs sync + marks 'synced' when no local conflict exists.
+    let status: 'local' | 'syncing' | 'synced' | 'offline' | 'error' = 'local';
+    let applied = false;
+    const conflictOutcome = await freshSyncSession({
+      getSnapshot: () => ({
+        accounts: [
+          {
+            id: 'acc-local',
+            userId: null,
+            name: 'Yerel Hesap',
+            type: 'bank',
+            currency: 'TRY',
+            initialBalance: 1000,
+            color: '#3B82F6',
+            icon: 'landmark',
+            isArchived: false,
+            createdAt: '2026-11-20T10:00:00.000Z',
+            updatedAt: '2026-11-20T10:00:00.000Z',
+            deletedAt: null,
+          },
+        ],
+        categories: freshDefaults(null),
+        transactions: [],
+        installmentPlans: [],
+        recurringRules: [],
+        budgets: [],
+        savingsGoals: [],
+        debts: [],
+        exchangeRates: [],
+        settings: {
+          baseCurrency: 'TRY',
+          theme: 'system',
+          privacyMode: false,
+          appLockEnabled: false,
+          notificationsEnabled: true,
+          monthStartDay: 1,
+        },
+      }),
+      getLastSyncedAt: () => null,
+      getSyncStatus: () => status,
+      setSyncStatus: (next) => {
+        status = next;
+      },
+      applyCloudState: () => {
+        applied = true;
+      },
+    });
+    expect(conflictOutcome).toEqual({ status: 'local_conflict' });
+    expect(status).toBe('local');
+    expect(applied).toBe(false);
+
+    const syncedOutcome = await freshSyncSession({
+      getSnapshot: () => ({
+        accounts: [],
+        categories: freshDefaults(null),
+        transactions: [],
+        installmentPlans: [],
+        recurringRules: [],
+        budgets: [],
+        savingsGoals: [],
+        debts: [],
+        exchangeRates: [],
+        settings: {
+          baseCurrency: 'TRY',
+          theme: 'system',
+          privacyMode: false,
+          appLockEnabled: false,
+          notificationsEnabled: true,
+          monthStartDay: 1,
+        },
+      }),
+      getLastSyncedAt: () => null,
+      getSyncStatus: () => status,
+      setSyncStatus: (next) => {
+        status = next;
+      },
+      applyCloudState: () => {
+        applied = true;
+        status = 'synced';
+      },
+    });
+    expect(syncedOutcome.status).toBe('synced');
+    expect(applied).toBe(true);
+    expect(status).toBe('synced');
   });
 });

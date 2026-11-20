@@ -32,7 +32,7 @@ import {
   filterReportTransactions,
 } from '@/domain/analytics';
 import { addMoney, subMoney } from '@/domain/money';
-import { addDays, parseIsoDate, toIsoDate } from '@/domain/periods';
+import { addDays, getLocalTodayIso, parseIsoDate, toIsoDate } from '@/domain/periods';
 import type { Transaction, TransactionType } from '@/domain/types';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { useResponsiveLayout, useTheme } from '@/theme/theme';
@@ -53,11 +53,6 @@ const TYPE_FILTER_OPTIONS: Array<{ value: TypeFilter; label: string }> = [
 ];
 
 const ALL_DATES_RANGE = { startDate: '0000-01-01', endDate: '9999-12-31' };
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
 
 function formatDateHeader(isoDate: string, todayIso: string, yesterdayIso: string): string {
   try {
@@ -151,6 +146,20 @@ export default function TransactionsScreen() {
     setAccountFilter('all');
     setCategoryFilter('all');
     setSearchQuery('');
+  };
+
+  const handleSelectTypeFilter = (nextType: TypeFilter) => {
+    setTypeFilter(nextType);
+    if (nextType === 'transfer') {
+      setCategoryFilter('all');
+      return;
+    }
+    if ((nextType === 'expense' || nextType === 'income') && categoryFilter !== 'all') {
+      const selectedCat = categoryMap.get(categoryFilter);
+      if (!selectedCat || selectedCat.type !== nextType) {
+        setCategoryFilter('all');
+      }
+    }
   };
 
   const filteredTransactions = useMemo(() => {
@@ -477,12 +486,7 @@ export default function TransactionsScreen() {
               key={opt.value}
               label={opt.label}
               selected={typeFilter === opt.value}
-              onPress={() => {
-                setTypeFilter(opt.value);
-                if (opt.value === 'transfer') {
-                  setCategoryFilter('all');
-                }
-              }}
+              onPress={() => handleSelectTypeFilter(opt.value)}
             />
           ))}
 

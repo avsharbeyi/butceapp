@@ -17,7 +17,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Card } from '@/components/ui/Card';
 import { ratesListToMap } from '@/domain/currency';
 import { formatMoney } from '@/domain/money';
-import { getFiscalMonthKey, toIsoDate } from '@/domain/periods';
+import { getFiscalMonthKey, getLocalTodayIso } from '@/domain/periods';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { TABULAR_NUMS_STYLE, useResponsiveLayout, useTheme } from '@/theme/theme';
 
@@ -29,11 +29,6 @@ interface HubItem {
   badge?: string;
   accentColor: string;
   renderIcon: (color: string) => React.ReactNode;
-}
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
 }
 
 export default function PlanHubScreen() {

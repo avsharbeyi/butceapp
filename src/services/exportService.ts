@@ -367,7 +367,7 @@ async function shareTextFileNative(
   const sharing = await import('expo-sharing');
   const file = new fs.File(fs.Paths.cache, filename);
   file.create({ overwrite: true });
-  file.write(content);
+  await file.write(content);
   if (await sharing.isAvailableAsync()) {
     await sharing.shareAsync(file.uri, { mimeType, dialogTitle: filename });
   }

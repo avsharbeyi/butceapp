@@ -15,7 +15,7 @@ import {
   recomputeGoalAmount,
 } from '@/domain/ledger';
 import { addMoney, formatMoney, roundMoney, subMoney } from '@/domain/money';
-import { addMonthsClamped, getFiscalMonthKey, parseIsoDate } from '@/domain/periods';
+import { addMonthsClamped, getFiscalMonthKey, getLocalTodayIso, parseIsoDate } from '@/domain/periods';
 import { advanceRuleDate, processDueRecurringRules } from '@/domain/recurring';
 import type {
   Account,
@@ -287,22 +287,24 @@ function reconcileGoalsAndDebts(params: {
   debts: Debt[];
   affectedGoalIds: Set<string>;
   affectedDebtIds: Set<string>;
+  rates: Record<CurrencyCode, number>;
   nowIso: string;
 }): {
   goals: SavingsGoal[];
   debts: Debt[];
   syncItems: Array<{ entity: SyncEntityName; recordId: string; op: 'upsert'; updatedAt: string }>;
 } {
-  const { prevTransactions, nextTransactions, affectedGoalIds, affectedDebtIds, nowIso } = params;
+  const { prevTransactions, nextTransactions, affectedGoalIds, affectedDebtIds, rates, nowIso } =
+    params;
   const syncItems: Array<{ entity: SyncEntityName; recordId: string; op: 'upsert'; updatedAt: string }> = [];
 
   const goals = params.goals.map((goal) => {
     if (!affectedGoalIds.has(goal.id)) {
       return goal;
     }
-    const priorLinked = recomputeGoalAmount(goal, prevTransactions, 0);
+    const priorLinked = recomputeGoalAmount(goal, prevTransactions, 0, rates);
     const manualOffset = Math.max(0, subMoney(goal.currentAmount, priorLinked));
-    const currentAmount = recomputeGoalAmount(goal, nextTransactions, manualOffset);
+    const currentAmount = recomputeGoalAmount(goal, nextTransactions, manualOffset, rates);
     const isCompleted = currentAmount >= goal.targetAmount;
     if (currentAmount === goal.currentAmount && isCompleted === goal.isCompleted) {
       return goal;
@@ -322,9 +324,9 @@ function reconcileGoalsAndDebts(params: {
     if (!affectedDebtIds.has(debt.id)) {
       return debt;
     }
-    const priorLinked = recomputeDebtPaidAmount(debt, prevTransactions, 0);
+    const priorLinked = recomputeDebtPaidAmount(debt, prevTransactions, 0, rates);
     const manualOffset = Math.max(0, subMoney(debt.paidAmount, priorLinked));
-    const paidAmount = recomputeDebtPaidAmount(debt, nextTransactions, manualOffset);
+    const paidAmount = recomputeDebtPaidAmount(debt, nextTransactions, manualOffset, rates);
     const isSettled = paidAmount >= debt.totalAmount;
     if (paidAmount === debt.paidAmount && isSettled === debt.isSettled) {
       return debt;
@@ -560,6 +562,7 @@ export const useFinanceStore = create<FinanceStoreState>()(
             debts: curr.debts,
             affectedGoalIds,
             affectedDebtIds,
+            rates: ratesListToMap(curr.exchangeRates),
             nowIso,
           });
           syncOps.push(...reconciled.syncItems);
@@ -664,6 +667,7 @@ export const useFinanceStore = create<FinanceStoreState>()(
             debts: curr.debts,
             affectedGoalIds,
             affectedDebtIds,
+            rates: ratesListToMap(curr.exchangeRates),
             nowIso,
           });
           syncOps.push(...reconciled.syncItems);
@@ -730,6 +734,7 @@ export const useFinanceStore = create<FinanceStoreState>()(
             debts: curr.debts,
             affectedGoalIds,
             affectedDebtIds,
+            rates: ratesListToMap(curr.exchangeRates),
             nowIso,
           });
           syncOps.push(...reconciled.syncItems);
@@ -928,7 +933,7 @@ export const useFinanceStore = create<FinanceStoreState>()(
         });
       },
 
-      runDueRecurringRules: (asOfDate = new Date().toISOString().slice(0, 10)) => {
+      runDueRecurringRules: (asOfDate = getLocalTodayIso()) => {
         const nowIso = new Date().toISOString();
         const curr = get();
         const rates = ratesListToMap(curr.exchangeRates);
@@ -1189,21 +1194,22 @@ export const useFinanceStore = create<FinanceStoreState>()(
             createdAt: nowIso,
             updatedAt: nowIso,
             deletedAt: null,
+            isDemo: prev.isDemo,
           });
         }
 
         if (created.length > 0) {
+          const syncOps = created
+            .filter((b) => b.isDemo !== true)
+            .map((b) => ({
+              entity: 'budgets' as const,
+              recordId: b.id,
+              op: 'upsert' as const,
+              updatedAt: nowIso,
+            }));
           set((state) => ({
             budgets: [...state.budgets, ...created],
-            syncQueue: enqueueSyncOps(
-              state.syncQueue,
-              created.map((b) => ({
-                entity: 'budgets' as const,
-                recordId: b.id,
-                op: 'upsert' as const,
-                updatedAt: nowIso,
-              })),
-            ),
+            syncQueue: enqueueSyncOps(state.syncQueue, syncOps),
           }));
         }
 
@@ -1286,22 +1292,46 @@ export const useFinanceStore = create<FinanceStoreState>()(
           return null;
         }
 
-        const txDate = date ?? new Date().toISOString().slice(0, 10);
+        const txDate = date ?? getLocalTodayIso();
+        const linkedAccount = state.accounts.find(
+          (a) => a.id === linkedAccountId && a.deletedAt === null,
+        );
+        const rates = ratesListToMap(state.exchangeRates);
+        const accountAmount =
+          linkedAccount && linkedAccount.currency !== goal.currency
+            ? convertAmount(safeAmount, goal.currency, linkedAccount.currency, rates)
+            : safeAmount;
+
+        if (isDeposit) {
+          return get().addTransaction({
+            userId: goal.userId,
+            type: 'transfer',
+            amount: accountAmount,
+            currency: linkedAccount ? linkedAccount.currency : goal.currency,
+            accountId: linkedAccountId,
+            toAccountId: null,
+            toAmount: linkedAccount && linkedAccount.currency !== goal.currency ? safeAmount : null,
+            categoryId: null,
+            goalId: goal.id,
+            date: txDate,
+            note: note ?? `${goal.name} kumbara aktarımı`,
+            tags: ['birikim'],
+            isDemo: goal.isDemo,
+          });
+        }
 
         return get().addTransaction({
           userId: goal.userId,
           type: 'transfer',
           amount: safeAmount,
           currency: goal.currency,
-          accountId: isDeposit ? linkedAccountId : '',
-          toAccountId: isDeposit ? null : linkedAccountId,
-          toAmount: isDeposit ? null : safeAmount,
+          accountId: '',
+          toAccountId: linkedAccountId,
+          toAmount: accountAmount,
           categoryId: null,
           goalId: goal.id,
           date: txDate,
-          note:
-            note ??
-            (isDeposit ? `${goal.name} kumbara aktarımı` : `${goal.name} kumbara çekimi`),
+          note: note ?? `${goal.name} kumbara çekimi`,
           tags: ['birikim'],
           isDemo: goal.isDemo,
         });
@@ -1413,7 +1443,7 @@ export const useFinanceStore = create<FinanceStoreState>()(
           accountId: linkedAccountId,
           categoryId: matchedCat?.id ?? null,
           debtId: debt.id,
-          date: date ?? new Date().toISOString().slice(0, 10),
+          date: date ?? getLocalTodayIso(),
           note:
             note ??
             (debt.direction === 'owed_to_me'
@@ -1562,6 +1592,7 @@ export const useFinanceStore = create<FinanceStoreState>()(
           ];
 
           let nextBudgets = state.budgets;
+          let nextTransactions = state.transactions;
           let nextAlerts = state.alertQueue;
 
           if (patch.baseCurrency && patch.baseCurrency !== prevBase) {
@@ -1588,13 +1619,33 @@ export const useFinanceStore = create<FinanceStoreState>()(
               };
             });
 
+            nextTransactions = state.transactions.map((tx) => {
+              if (tx.deletedAt !== null) {
+                return tx;
+              }
+              if (!tx.isDemo) {
+                syncOps.push({
+                  entity: 'transactions',
+                  recordId: tx.id,
+                  op: 'upsert',
+                  updatedAt: nowIso,
+                });
+              }
+              return {
+                ...tx,
+                baseAmount: convertAmount(tx.baseAmount, prevBase, nextBase, rates),
+                exchangeRateToBase: getRateToBase(tx.currency, nextBase, rates),
+                updatedAt: nowIso,
+              };
+            });
+
             nextAlerts = [
               ...state.alertQueue,
               {
                 id: generateEntityId(),
                 level: 'info',
                 title: 'Ana Para Birimi Güncellendi',
-                message: `Ana para birimi ${nextBase} olarak değiştirildi ve aktif bütçe limitleri güncel kurlarla dönüştürüldü.`,
+                message: `Ana para birimi ${nextBase} olarak değiştirildi; aktif bütçe limitleri ve işlem tutarları güncel kurlarla yeniden değerlendi.`,
                 createdAt: nowIso,
               },
             ];
@@ -1603,6 +1654,7 @@ export const useFinanceStore = create<FinanceStoreState>()(
           return {
             settings: nextSettings,
             budgets: nextBudgets,
+            transactions: nextTransactions,
             alertQueue: nextAlerts,
             syncQueue: enqueueSyncOps(state.syncQueue, syncOps),
           };

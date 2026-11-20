@@ -27,7 +27,7 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { MoneyText } from '@/components/ui/MoneyText';
 import { convertAmount, ratesListToMap } from '@/domain/currency';
 import { addMoney, formatPercent, roundMoney } from '@/domain/money';
-import { parseIsoDate, toIsoDate } from '@/domain/periods';
+import { getLocalTodayIso, parseIsoDate } from '@/domain/periods';
 import type { CurrencyCode, SavingsGoal } from '@/domain/types';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { TABULAR_NUMS_STYLE, useResponsiveLayout, useTheme } from '@/theme/theme';
@@ -44,11 +44,6 @@ const COLOR_SWATCHES = [
   '#EF4444',
   '#14B8A6',
 ] as const;
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
 
 function parsePositiveAmount(raw: string): number | null {
   const normalized = raw.trim().replace(/\s+/g, '').replace(',', '.');

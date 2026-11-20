@@ -19,7 +19,7 @@ import { MoneyText } from '@/components/ui/MoneyText';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { convertAmount, ratesListToMap } from '@/domain/currency';
 import { addMoney, formatPercent, roundMoney, subMoney } from '@/domain/money';
-import { parseIsoDate, toIsoDate } from '@/domain/periods';
+import { getLocalTodayIso, parseIsoDate } from '@/domain/periods';
 import type { CurrencyCode, Debt } from '@/domain/types';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { TABULAR_NUMS_STYLE, useResponsiveLayout, useTheme } from '@/theme/theme';
@@ -32,11 +32,6 @@ const DIRECTION_TABS: Array<{ value: DebtDirection; label: string }> = [
   { value: 'owed_by_me', label: 'Borçlarım' },
   { value: 'owed_to_me', label: 'Alacaklarım' },
 ];
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
 
 function parsePositiveAmount(raw: string): number | null {
   const normalized = raw.trim().replace(/\s+/g, '').replace(',', '.');

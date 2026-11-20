@@ -39,11 +39,11 @@ import { ratesListToMap } from '@/domain/currency';
 import { formatPercent } from '@/domain/money';
 import {
   getFiscalMonthKey,
+  getLocalTodayIso,
   getPeriodRange,
   getPreviousPeriodRange,
   parseIsoDate,
   shiftPeriodAnchor,
-  toIsoDate,
 } from '@/domain/periods';
 import type { DateRange, PeriodType } from '@/domain/types';
 import { useFinanceStore } from '@/store/useFinanceStore';
@@ -61,11 +61,6 @@ const DONUT_TYPE_OPTIONS: Array<{ value: 'expense' | 'income'; label: string }> 
   { value: 'expense', label: 'Gider' },
   { value: 'income', label: 'Gelir' },
 ];
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
 
 function formatShortDateTr(isoDate: string): string {
   try {

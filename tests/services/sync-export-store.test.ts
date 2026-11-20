@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { buildQuickAddSavePlan } from '@/components/quickAddHelpers';
 import { buildSharedReportSnapshot } from '@/domain/analytics';
-import { createDefaultCategories, createDefaultExchangeRates, DEFAULT_SETTINGS } from '@/domain/defaults';
+import {
+  buildDemoDataset,
+  createDefaultCategories,
+  createDefaultExchangeRates,
+  DEFAULT_SETTINGS,
+} from '@/domain/defaults';
+import { computeAccountBalance, computeNetWorth } from '@/domain/ledger';
 import type {
   Account,
   Budget,
@@ -18,6 +25,8 @@ import {
   generateTransactionsCsv,
   parseBackupJson,
   sanitizeCsvCell,
+  shareCsvFile,
+  shareJsonBackup,
   sharePdfReport,
 } from '@/services/exportService';
 import { fetchLiveRates } from '@/services/fxService';
@@ -440,6 +449,105 @@ describe('Review Focus #5: Demo isolation, category deduplication & LWW sync', (
     expect(toUpload.budgets).toHaveLength(1);
     expect(toUpload.budgets[0].id).toBe('rem-budget-1');
     expect(toUpload.budgets[0].limitAmount).toBe(7_500);
+  });
+
+  it('demo-to-empty-cloud login seeds all 20 default categories and drops orphaned demo-referencing items', () => {
+    const demo = buildDemoDataset('2026-11-20');
+    const demoAcc = demo.accounts[0];
+    const demoGoal = demo.savingsGoals[0];
+    const demoDebt = demo.debts[0];
+    const demoPlan = demo.installmentPlans[0];
+    const defaultMarketId = demo.categories.find((c) => c.name === 'Market')!.id;
+
+    const realAccount = makeAccount({ id: 'acc-real-user', name: 'Kullanıcı Banka' });
+    const orphanDemoAccountTx = makeTx({
+      id: 'tx-orphan-acc',
+      type: 'expense',
+      amount: 100,
+      accountId: demoAcc.id,
+      categoryId: defaultMarketId,
+      date: '2026-11-20',
+    });
+    const orphanDemoGoalTx = makeTx({
+      id: 'tx-orphan-goal',
+      type: 'transfer',
+      amount: 200,
+      accountId: realAccount.id,
+      toAccountId: null,
+      goalId: demoGoal.id,
+      date: '2026-11-20',
+    });
+    const orphanDemoDebtTx = makeTx({
+      id: 'tx-orphan-debt',
+      type: 'expense',
+      amount: 300,
+      accountId: realAccount.id,
+      debtId: demoDebt.id,
+      date: '2026-11-20',
+    });
+    const orphanDemoPlanTx = makeTx({
+      id: 'tx-orphan-plan',
+      type: 'expense',
+      amount: 400,
+      accountId: realAccount.id,
+      installmentPlanId: demoPlan.id,
+      date: '2026-11-20',
+    });
+    const orphanDemoCatBudget: Budget = {
+      id: 'b-orphan-cat',
+      userId: null,
+      categoryId: 'non-existent-demo-cat',
+      month: '2026-11',
+      limitAmount: 1_000,
+      currency: 'TRY',
+      alert80Sent: false,
+      alert100Sent: false,
+      createdAt: NOW,
+      updatedAt: NOW,
+      deletedAt: null,
+    };
+    const validRealTx = makeTx({
+      id: 'tx-valid-real',
+      type: 'expense',
+      amount: 250,
+      accountId: realAccount.id,
+      categoryId: defaultMarketId,
+      date: '2026-11-20',
+    });
+
+    const localState: FinanceDataSnapshot = {
+      ...demo,
+      accounts: [...demo.accounts, realAccount],
+      transactions: [
+        ...demo.transactions,
+        orphanDemoAccountTx,
+        orphanDemoGoalTx,
+        orphanDemoDebtTx,
+        orphanDemoPlanTx,
+        validRealTx,
+      ],
+      budgets: [...demo.budgets, orphanDemoCatBudget],
+    };
+
+    const emptyCloud = makeSnapshot();
+    const { nextState, toUpload } = mergeLocalIntoCloud(
+      localState,
+      emptyCloud,
+      'merge',
+      'user-cloud-1',
+    );
+
+    expect(nextState.categories).toHaveLength(20);
+    expect(nextState.categories.every((c) => c.isDemo !== true && c.userId === 'user-cloud-1')).toBe(
+      true,
+    );
+    expect(toUpload.categories).toHaveLength(20);
+
+    expect(nextState.accounts.map((a) => a.id)).toEqual(['acc-real-user']);
+    expect(nextState.transactions.map((t) => t.id)).toEqual(['tx-valid-real']);
+    expect(toUpload.transactions.map((t) => t.id)).toEqual(['tx-valid-real']);
+    expect(nextState.budgets).toHaveLength(0);
+    expect(toUpload.budgets).toHaveLength(0);
   });
 });
 
@@ -926,15 +1034,54 @@ describe('JSON Backup, HTML Report & Store Integration', () => {
     expect(copied[0].alert100Sent).toBe(false);
   });
 
-  it('updateSettings converts active budgets when baseCurrency changes and queues info alert', () => {
+  it('copyPreviousMonthBudgets preserves isDemo: true without enqueueing into syncQueue', () => {
+    const store = useFinanceStore.getState();
+    store.loadDemoData('2026-11-20');
+    useFinanceStore.setState((curr) => ({
+      budgets: curr.budgets.map((b) =>
+        b.deletedAt === null ? { ...b, month: '2026-10' } : b,
+      ),
+      syncQueue: [],
+    }));
+
+    const copied = store.copyPreviousMonthBudgets('2026-11');
+    expect(copied.length).toBeGreaterThan(0);
+    expect(copied.every((b) => b.isDemo === true)).toBe(true);
+    expect(useFinanceStore.getState().syncQueue).toHaveLength(0);
+  });
+
+  it('updateSettings converts active budgets AND revalues transactions.baseAmount when baseCurrency changes', () => {
     const store = useFinanceStore.getState();
     store.setManualRate('USD', 40);
+    const bank = store.addAccount({
+      name: 'Banka',
+      type: 'bank',
+      currency: 'TRY',
+      initialBalance: 10_000,
+      color: '#3B82F6',
+      icon: 'landmark',
+      isArchived: false,
+    });
+    const marketCat = useFinanceStore
+      .getState()
+      .categories.find((c) => c.name === 'Market' && c.type === 'expense')!;
+
     store.upsertBudget({
       categoryId: null,
       month: '2026-11',
       limitAmount: 40_000,
       currency: 'TRY',
     });
+    const tx = store.addTransaction({
+      type: 'expense',
+      amount: 4_000,
+      currency: 'TRY',
+      accountId: bank.id,
+      categoryId: marketCat.id,
+      date: '2026-11-20',
+      note: 'TRY Harcama',
+    });
+    store.clearSyncQueue();
 
     store.updateSettings({ baseCurrency: 'USD' });
 
@@ -942,7 +1089,226 @@ describe('JSON Backup, HTML Report & Store Integration', () => {
     expect(state.settings.baseCurrency).toBe('USD');
     expect(state.budgets[0].currency).toBe('USD');
     expect(state.budgets[0].limitAmount).toBe(1_000);
+    const updatedTx = state.transactions.find((t) => t.id === tx.id)!;
+    expect(updatedTx.baseAmount).toBe(100);
+    expect(updatedTx.exchangeRateToBase).toBe(0.025);
+    expect(
+      state.syncQueue.some((op) => op.entity === 'transactions' && op.recordId === tx.id),
+    ).toBe(true);
     expect(state.alertQueue.some((a) => a.level === 'info')).toBe(true);
+  });
+
+  it('handles cross-currency goal contributions and debt payments while conserving 2A Net Worth', () => {
+    const store = useFinanceStore.getState();
+    store.setManualRate('USD', 40);
+
+    const tryBank = store.addAccount({
+      name: 'TRY Banka',
+      type: 'bank',
+      currency: 'TRY',
+      initialBalance: 10_000,
+      color: '#3B82F6',
+      icon: 'landmark',
+      isArchived: false,
+    });
+    const usdGoal = store.addGoal({
+      name: 'USD Tatil',
+      targetAmount: 500,
+      currentAmount: 0,
+      currency: 'USD',
+      icon: 'plane',
+      color: '#0EA5E9',
+    });
+
+    const rates = { TRY: 1, USD: 40, EUR: 44, GBP: 50, XAU: 3500 };
+    const getNetWorth = () => {
+      const s = useFinanceStore.getState();
+      return computeNetWorth({
+        accounts: s.accounts,
+        goals: s.savingsGoals,
+        debts: s.debts,
+        transactions: s.transactions,
+        rates,
+        baseCurrency: 'TRY',
+        asOfDate: '2026-11-20',
+      });
+    };
+
+    expect(getNetWorth().netWorth).toBe(10_000);
+
+    // Deposit 100 USD from TRY bank -> bank drops 4,000 TRY, goal rises 100 USD, Net Worth conserved
+    store.contributeToGoal({
+      goalId: usdGoal.id,
+      amount: 100,
+      accountId: tryBank.id,
+      direction: 'deposit',
+      date: '2026-11-20',
+    });
+
+    let state = useFinanceStore.getState();
+    expect(state.savingsGoals[0].currentAmount).toBe(100);
+    expect(computeAccountBalance(tryBank, state.transactions, '2026-11-20', rates)).toBe(6_000);
+    expect(getNetWorth().netWorth).toBe(10_000);
+
+    // Withdraw 50 USD back to TRY bank -> bank rises 2,000 TRY, goal drops to 50 USD, Net Worth conserved
+    store.contributeToGoal({
+      goalId: usdGoal.id,
+      amount: 50,
+      accountId: tryBank.id,
+      direction: 'withdraw',
+      date: '2026-11-20',
+    });
+
+    state = useFinanceStore.getState();
+    expect(state.savingsGoals[0].currentAmount).toBe(50);
+    expect(computeAccountBalance(tryBank, state.transactions, '2026-11-20', rates)).toBe(8_000);
+    expect(getNetWorth().netWorth).toBe(10_000);
+
+    // Pay 25 USD debt from TRY bank -> bank drops 1,000 TRY, debt paidAmount = 25 USD
+    const usdDebt = store.addDebt({
+      personName: 'Can',
+      direction: 'owed_by_me',
+      totalAmount: 100,
+      paidAmount: 0,
+      currency: 'USD',
+    });
+    store.recordDebtPayment({
+      debtId: usdDebt.id,
+      amount: 25,
+      accountId: tryBank.id,
+      date: '2026-11-20',
+    });
+    state = useFinanceStore.getState();
+    expect(state.debts[0].paidAmount).toBe(25);
+    expect(computeAccountBalance(tryBank, state.transactions, '2026-11-20', rates)).toBe(7_000);
+  });
+
+  it('preserves Kumbara deposit and withdrawal directions when editing via QuickAdd save helper', () => {
+    const goal = {
+      id: 'goal-1',
+      userId: null,
+      name: 'Acil Fon',
+      targetAmount: 10_000,
+      currentAmount: 2_000,
+      currency: 'TRY' as const,
+      icon: 'piggy-bank',
+      color: '#10B981',
+      isCompleted: false,
+      createdAt: NOW,
+      updatedAt: NOW,
+      deletedAt: null,
+    };
+    const rates = { TRY: 1, USD: 40, EUR: 44, GBP: 50, XAU: 3500 };
+
+    const depositTx = makeTx({
+      id: 'tx-goal-dep',
+      type: 'transfer',
+      amount: 1_000,
+      accountId: 'acc-bank',
+      toAccountId: null,
+      toAmount: null,
+      categoryId: null,
+      goalId: 'goal-1',
+      date: '2026-11-20',
+    });
+
+    const depPlan = buildQuickAddSavePlan({
+      isEditing: true,
+      initialTransaction: depositTx,
+      linkedGoal: goal,
+      txType: 'transfer',
+      numericAmount: 1_500,
+      currency: 'TRY',
+      accountId: 'acc-bank',
+      toAccountId: '',
+      toAmountOverride: null,
+      categoryId: '',
+      cleanDate: '2026-11-20',
+      cleanNote: 'Güncel aktarım',
+      parsedTags: ['birikim'],
+      receiptUri: null,
+      ratesMap: rates,
+    });
+    expect(depPlan.ok).toBe(true);
+    if (depPlan.ok && depPlan.mode === 'update') {
+      expect(depPlan.patch.accountId).toBe('acc-bank');
+      expect(depPlan.patch.toAccountId).toBeNull();
+      expect(depPlan.patch.goalId).toBe('goal-1');
+      expect(depPlan.patch.amount).toBe(1_500);
+    }
+
+    const withdrawTx = makeTx({
+      id: 'tx-goal-wd',
+      type: 'transfer',
+      amount: 500,
+      accountId: '',
+      toAccountId: 'acc-bank',
+      toAmount: 500,
+      categoryId: null,
+      goalId: 'goal-1',
+      date: '2026-11-20',
+    });
+
+    const wdPlan = buildQuickAddSavePlan({
+      isEditing: true,
+      initialTransaction: withdrawTx,
+      linkedGoal: goal,
+      txType: 'transfer',
+      numericAmount: 750,
+      currency: 'TRY',
+      accountId: '',
+      toAccountId: 'acc-bank',
+      targetAccountCurrency: 'TRY',
+      toAmountOverride: null,
+      categoryId: '',
+      cleanDate: '2026-11-20',
+      cleanNote: 'Güncel çekim',
+      parsedTags: ['birikim'],
+      receiptUri: null,
+      ratesMap: rates,
+    });
+    expect(wdPlan.ok).toBe(true);
+    if (wdPlan.ok && wdPlan.mode === 'update') {
+      expect(wdPlan.patch.accountId).toBe('');
+      expect(wdPlan.patch.toAccountId).toBe('acc-bank');
+      expect(wdPlan.patch.toAmount).toBe(750);
+      expect(wdPlan.patch.goalId).toBe('goal-1');
+    }
+  });
+
+  it('awaits native file write before calling shareAsync for CSV and JSON exports', async () => {
+    const events: string[] = [];
+    vi.doMock('expo-file-system', () => ({
+      Paths: { cache: 'file:///cache' },
+      File: class MockFile {
+        uri = 'file:///cache/export.txt';
+        create() {
+          events.push('create');
+        }
+        async write() {
+          await new Promise((r) => setTimeout(r, 10));
+          events.push('write_done');
+        }
+      },
+    }));
+    vi.doMock('expo-sharing', () => ({
+      isAvailableAsync: async () => true,
+      shareAsync: async () => {
+        events.push('share');
+      },
+    }));
+
+    try {
+      await shareCsvFile('col1,col2\n1,2', 'test.csv');
+      expect(events).toEqual(['create', 'write_done', 'share']);
+
+      events.length = 0;
+      await shareJsonBackup('{"schemaVersion":1}', 'yedek.json');
+      expect(events).toEqual(['create', 'write_done', 'share']);
+    } finally {
+      vi.doUnmock('expo-file-system');
+      vi.doUnmock('expo-sharing');
+    }
   });
 
   it('addInstallmentPlan generates installment txs and deleteInstallmentPlan soft-deletes them', () => {

@@ -17,6 +17,7 @@ import {
   getBucketsForPeriod,
   getFiscalMonthKey,
   getFiscalMonthRange,
+  getLocalTodayIso,
   getPeriodRange,
   getPreviousPeriodRange,
   parseIsoDate,
@@ -77,6 +78,7 @@ describe('money arithmetic & formatting', () => {
 describe('timezone-safe dates & fiscal periods', () => {
   it('parses, formats, and computes daysInMonth in UTC', () => {
     expect(toIsoDate(2026, 2, 5)).toBe('2026-02-05');
+    expect(getLocalTodayIso(new Date(2026, 10, 20, 0, 15, 0))).toBe('2026-11-20');
     expect(parseIsoDate('2026-11-20')).toEqual({ year: 2026, month: 11, day: 20 });
     expect(daysInMonth(2026, 2)).toBe(28);
     expect(daysInMonth(2028, 2)).toBe(29);

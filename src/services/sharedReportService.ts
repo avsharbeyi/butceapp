@@ -134,14 +134,24 @@ function sanitizeSnapshotForSharing(
     includeTransactions,
     includeNotes,
     transactions: includeTransactions
-      ? snapshot.transactions.map((tx) =>
-          includeNotes
-            ? tx
-            : {
-                ...tx,
-                note: undefined,
-              },
-        )
+      ? snapshot.transactions.map((tx) => {
+          const baseTx = {
+            id: tx.id,
+            date: tx.date,
+            type: tx.type,
+            categoryName: tx.categoryName,
+            baseAmount: tx.baseAmount,
+            currency: tx.currency,
+          };
+          if (!includeNotes) {
+            return baseTx;
+          }
+          return {
+            ...baseTx,
+            ...(tx.note !== undefined ? { note: tx.note } : {}),
+            ...(tx.tags !== undefined ? { tags: [...tx.tags] } : {}),
+          };
+        })
       : [],
   };
 }
@@ -349,7 +359,10 @@ export async function fetchPublicSharedReport(
   const client = getSupabaseClient();
   if (client) {
     const { data, error } = await client.rpc('get_shared_report', { p_token: trimmed });
-    if (!error && data && typeof data === 'object') {
+    if (error) {
+      throw new Error(error.message || 'Paylaşılan rapor yüklenemedi.');
+    }
+    if (data && typeof data === 'object') {
       const payload = data as { status?: string; report?: SnakeRow };
       if (payload.status === 'revoked') {
         return { status: 'revoked' };
@@ -363,7 +376,11 @@ export async function fetchPublicSharedReport(
           report: mapSnakeSharedReportRow(payload.report, trimmed),
         };
       }
+      if (payload.status === 'not_found') {
+        return fetchLocalPublicSharedReport(trimmed, nowIso);
+      }
     }
+    return { status: 'not_found' };
   }
 
   return fetchLocalPublicSharedReport(trimmed, nowIso);

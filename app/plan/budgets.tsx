@@ -33,19 +33,14 @@ import {
   addMonthsClamped,
   getFiscalMonthKey,
   getFiscalMonthRange,
+  getLocalTodayIso,
   parseIsoDate,
-  toIsoDate,
 } from '@/domain/periods';
 import type { BudgetProgressItem, CurrencyCode } from '@/domain/types';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { TABULAR_NUMS_STYLE, useResponsiveLayout, useTheme } from '@/theme/theme';
 
 const CURRENCIES: CurrencyCode[] = ['TRY', 'USD', 'EUR', 'GBP', 'XAU'];
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
 
 function formatMonthTitleTr(monthKey: string): string {
   const [yStr, mStr] = monthKey.split('-');

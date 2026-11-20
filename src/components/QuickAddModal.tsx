@@ -19,17 +19,22 @@ import {
   ChevronUp,
   Delete,
   Minus,
+  PiggyBank,
   Plus,
   Trash2,
   X,
 } from 'lucide-react-native';
+import {
+  buildQuickAddSavePlan,
+  getGoalTransferDirection,
+} from '@/components/quickAddHelpers';
 import { Chip } from '@/components/ui/Chip';
 import { ConfirmModal } from '@/components/ui/ConfirmModal';
 import { MoneyText } from '@/components/ui/MoneyText';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { convertAmount, ratesListToMap } from '@/domain/currency';
 import { getCurrencySymbol, roundMoney } from '@/domain/money';
-import { addDays, parseIsoDate } from '@/domain/periods';
+import { addDays, getLocalTodayIso, parseIsoDate } from '@/domain/periods';
 import { advanceRuleDate } from '@/domain/recurring';
 import type { CurrencyCode, Frequency, Transaction, TransactionType } from '@/domain/types';
 import { useFinanceStore } from '@/store/useFinanceStore';
@@ -67,10 +72,6 @@ const NUMPAD_ROWS = [
   [',', '0', 'BACK'],
 ] as const;
 
-function getTodayIso(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
 function amountToInputString(amount: number): string {
   if (!Number.isFinite(amount) || amount <= 0) {
     return '';
@@ -101,6 +102,7 @@ export function QuickAddModal({
 
   const accounts = useFinanceStore((s) => s.accounts);
   const categories = useFinanceStore((s) => s.categories);
+  const savingsGoals = useFinanceStore((s) => s.savingsGoals);
   const exchangeRates = useFinanceStore((s) => s.exchangeRates);
   const baseCurrency = useFinanceStore((s) => s.settings.baseCurrency);
   const addTransaction = useFinanceStore((s) => s.addTransaction);
@@ -111,6 +113,18 @@ export function QuickAddModal({
 
   const ratesMap = useMemo(() => ratesListToMap(exchangeRates), [exchangeRates]);
   const isEditing = Boolean(initialTransaction);
+  const goalDirection = isEditing ? getGoalTransferDirection(initialTransaction) : null;
+  const isGoalTransfer = goalDirection !== null;
+  const isGoalDeposit = goalDirection === 'deposit';
+  const isGoalWithdraw = goalDirection === 'withdraw';
+
+  const linkedGoal = useMemo(
+    () =>
+      initialTransaction?.goalId
+        ? (savingsGoals.find((g) => g.id === initialTransaction.goalId) ?? null)
+        : null,
+    [initialTransaction?.goalId, savingsGoals],
+  );
 
   const selectableAccounts = useMemo(
     () =>
@@ -130,9 +144,10 @@ export function QuickAddModal({
   const [accountId, setAccountId] = useState('');
   const [toAccountId, setToAccountId] = useState('');
   const [toAmountStr, setToAmountStr] = useState('');
+  const [toAmountTouched, setToAmountTouched] = useState(false);
   const [categoryId, setCategoryId] = useState<string>('');
   const [detailsExpanded, setDetailsExpanded] = useState(false);
-  const [date, setDate] = useState(getTodayIso());
+  const [date, setDate] = useState(() => getLocalTodayIso());
   const [note, setNote] = useState('');
   const [tagsText, setTagsText] = useState('');
   const [installmentCount, setInstallmentCount] = useState(1);
@@ -155,6 +170,10 @@ export function QuickAddModal({
 
   const selectableAccountsRef = useRef(selectableAccounts);
   selectableAccountsRef.current = selectableAccounts;
+  const ratesMapRef = useRef(ratesMap);
+  ratesMapRef.current = ratesMap;
+  const linkedGoalRef = useRef(linkedGoal);
+  linkedGoalRef.current = linkedGoal;
 
   useEffect(() => {
     if (!visible) {
@@ -165,16 +184,38 @@ export function QuickAddModal({
     setConfirmDeleteVisible(false);
 
     if (initialTransaction) {
+      const initGoalDir = getGoalTransferDirection(initialTransaction);
+      const currentGoal = linkedGoalRef.current;
+      const initTargetAcc = selectableAccountsRef.current.find(
+        (a) => a.id === initialTransaction.toAccountId,
+      );
+      const targetCurr =
+        initGoalDir === 'deposit' ? currentGoal?.currency : initTargetAcc?.currency;
+      const expectedAuto =
+        targetCurr != null
+          ? convertAmount(
+              initialTransaction.amount,
+              initialTransaction.currency,
+              targetCurr,
+              ratesMapRef.current,
+            )
+          : null;
+      const hasCustomToAmount =
+        initialTransaction.toAmount != null &&
+        expectedAuto != null &&
+        initialTransaction.toAmount !== expectedAuto;
+
       setTxType(initialTransaction.type);
       setAmountStr(amountToInputString(initialTransaction.amount));
       setCurrency(initialTransaction.currency);
       setAccountId(initialTransaction.accountId);
       setToAccountId(initialTransaction.toAccountId ?? '');
       setToAmountStr(
-        initialTransaction.toAmount != null
+        hasCustomToAmount && initialTransaction.toAmount != null
           ? amountToInputString(initialTransaction.toAmount)
           : '',
       );
+      setToAmountTouched(hasCustomToAmount);
       setCategoryId(initialTransaction.categoryId ?? '');
       setDate(initialTransaction.date);
       setNote(initialTransaction.note ?? '');
@@ -203,8 +244,9 @@ export function QuickAddModal({
     setAccountId(firstAcc?.id ?? '');
     setToAccountId(secondAcc?.id ?? '');
     setToAmountStr('');
+    setToAmountTouched(false);
     setCategoryId('');
-    setDate(getTodayIso());
+    setDate(getLocalTodayIso());
     setNote('');
     setTagsText('');
     setInstallmentCount(1);
@@ -248,11 +290,20 @@ export function QuickAddModal({
   }, [numericAmount, currency, baseCurrency, ratesMap]);
 
   const suggestedTargetAmount = useMemo(() => {
-    if (txType !== 'transfer' || numericAmount <= 0 || !targetAccount) {
+    if (txType !== 'transfer' || numericAmount <= 0) {
+      return 0;
+    }
+    if (isGoalDeposit) {
+      if (!linkedGoal || linkedGoal.currency === currency) {
+        return 0;
+      }
+      return convertAmount(numericAmount, currency, linkedGoal.currency, ratesMap);
+    }
+    if (!targetAccount) {
       return 0;
     }
     return convertAmount(numericAmount, currency, targetAccount.currency, ratesMap);
-  }, [txType, numericAmount, currency, targetAccount, ratesMap]);
+  }, [txType, numericAmount, currency, targetAccount, isGoalDeposit, linkedGoal, ratesMap]);
 
   const handleSelectType = (nextType: TransactionType) => {
     setTxType(nextType);
@@ -320,15 +371,6 @@ export function QuickAddModal({
   const handleSave = () => {
     setErrorMsg(null);
 
-    if (numericAmount <= 0) {
-      setErrorMsg('Lütfen 0’dan büyük geçerli bir tutar girin.');
-      return;
-    }
-    if (!accountId) {
-      setErrorMsg('Lütfen bir hesap seçin.');
-      return;
-    }
-
     try {
       parseIsoDate(date.trim());
     } catch {
@@ -342,47 +384,35 @@ export function QuickAddModal({
       .split(',')
       .map((t) => t.trim())
       .filter((t) => t.length > 0);
+    const toAmountOverride =
+      toAmountTouched && toAmountStr.trim() ? parseAmountInput(toAmountStr) : null;
 
-    if (txType === 'transfer') {
-      if (!toAccountId) {
-        setErrorMsg('Lütfen transfer için hedef hesap seçin.');
-        return;
-      }
-      if (toAccountId === accountId) {
-        setErrorMsg('Kaynak ve hedef hesap aynı olamaz.');
-        return;
-      }
-    } else if (!categoryId) {
-      setErrorMsg('Lütfen bir kategori seçin.');
+    const savePlan = buildQuickAddSavePlan({
+      isEditing,
+      initialTransaction,
+      linkedGoal,
+      txType,
+      numericAmount,
+      currency,
+      accountId,
+      toAccountId,
+      targetAccountCurrency: targetAccount?.currency ?? null,
+      toAmountOverride,
+      categoryId,
+      cleanDate,
+      cleanNote,
+      parsedTags,
+      receiptUri,
+      ratesMap,
+    });
+
+    if (!savePlan.ok) {
+      setErrorMsg(savePlan.error);
       return;
     }
 
-    const resolvedToAmount =
-      txType === 'transfer'
-        ? toAmountStr.trim()
-          ? parseAmountInput(toAmountStr)
-          : suggestedTargetAmount
-        : null;
-
-    if (txType === 'transfer' && (!resolvedToAmount || resolvedToAmount <= 0)) {
-      setErrorMsg('Lütfen geçerli bir hedef tutar girin.');
-      return;
-    }
-
-    if (isEditing && initialTransaction) {
-      updateTransaction(initialTransaction.id, {
-        type: txType,
-        amount: numericAmount,
-        currency,
-        accountId,
-        toAccountId: txType === 'transfer' ? toAccountId : null,
-        toAmount: txType === 'transfer' ? resolvedToAmount : null,
-        categoryId: txType === 'transfer' ? null : categoryId,
-        date: cleanDate,
-        note: cleanNote || undefined,
-        tags: parsedTags,
-        receiptUri,
-      });
+    if (savePlan.mode === 'update') {
+      updateTransaction(savePlan.id, savePlan.patch);
       onClose();
       return;
     }
@@ -426,19 +456,10 @@ export function QuickAddModal({
     }
 
     addTransaction({
-      type: txType,
-      amount: numericAmount,
-      currency,
-      accountId,
-      toAccountId: txType === 'transfer' ? toAccountId : null,
-      toAmount: txType === 'transfer' ? resolvedToAmount : null,
-      categoryId: txType === 'transfer' ? null : categoryId,
-      date: cleanDate,
-      note: cleanNote || undefined,
+      ...savePlan.txInput,
       tags: recurringRuleId
-        ? Array.from(new Set([...parsedTags, 'tekrar']))
-        : parsedTags,
-      receiptUri,
+        ? Array.from(new Set([...savePlan.txInput.tags, 'tekrar']))
+        : savePlan.txInput.tags,
       recurringRuleId,
     });
 
@@ -453,7 +474,7 @@ export function QuickAddModal({
     onClose();
   };
 
-  const todayIso = getTodayIso();
+  const todayIso = getLocalTodayIso();
   const yesterdayIso = addDays(todayIso, -1);
 
   const typeAccent =
@@ -511,11 +532,34 @@ export function QuickAddModal({
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
-            <SegmentedControl
-              options={TYPE_OPTIONS}
-              value={txType}
-              onChange={handleSelectType}
-            />
+            {isGoalTransfer ? (
+              <View
+                style={[
+                  styles.goalBadge,
+                  {
+                    backgroundColor: theme.colors.accentSoft,
+                    borderColor: theme.colors.accent,
+                    borderRadius: theme.radius.md,
+                  },
+                ]}
+              >
+                <PiggyBank size={18} color={theme.colors.accent} />
+                <View style={styles.goalBadgeTextWrap}>
+                  <Text style={[styles.goalBadgeTitle, { color: theme.colors.text }]}>
+                    Kumbara: {linkedGoal?.name ?? 'Birikim Hedefi'}
+                  </Text>
+                  <Text style={[styles.goalBadgeSub, { color: theme.colors.muted }]}>
+                    {isGoalDeposit ? 'Hesaptan Kumbaraya Aktarım' : 'Kumbaradan Hesaba Çekim'}
+                  </Text>
+                </View>
+              </View>
+            ) : (
+              <SegmentedControl
+                options={TYPE_OPTIONS}
+                value={txType}
+                onChange={handleSelectType}
+              />
+            )}
 
             <View
               style={[
@@ -619,74 +663,54 @@ export function QuickAddModal({
               ))}
             </View>
 
-            <View style={styles.section}>
-              <Text style={[styles.sectionLabel, { color: theme.colors.muted }]}>
-                {txType === 'transfer' ? 'Kaynak Hesap' : 'Hesap'}
-              </Text>
-              {selectableAccounts.length === 0 ? (
-                <Text style={[styles.helperText, { color: theme.colors.warning }]}>
-                  Aktif hesap bulunamadı. Önce bir hesap oluşturun.
-                </Text>
-              ) : (
-                <ScrollView
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  contentContainerStyle={styles.chipRow}
-                >
-                  {selectableAccounts.map((acc) => (
-                    <Chip
-                      key={acc.id}
-                      label={`${acc.name} (${acc.currency})`}
-                      selected={accountId === acc.id}
-                      color={acc.color}
-                      onPress={() => {
-                        setAccountId(acc.id);
-                        if (!isEditing) {
-                          setCurrency(acc.currency);
-                        }
-                      }}
-                    />
-                  ))}
-                </ScrollView>
-              )}
-            </View>
-
-            {txType === 'transfer' ? (
+            {!isGoalWithdraw ? (
               <View style={styles.section}>
                 <Text style={[styles.sectionLabel, { color: theme.colors.muted }]}>
-                  Hedef Hesap
+                  {txType === 'transfer' ? 'Kaynak Hesap' : 'Hesap'}
                 </Text>
-                <ScrollView
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  contentContainerStyle={styles.chipRow}
-                >
-                  {selectableAccounts
-                    .filter((a) => a.id !== accountId)
-                    .map((acc) => (
+                {selectableAccounts.length === 0 ? (
+                  <Text style={[styles.helperText, { color: theme.colors.warning }]}>
+                    Aktif hesap bulunamadı. Önce bir hesap oluşturun.
+                  </Text>
+                ) : (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.chipRow}
+                  >
+                    {selectableAccounts.map((acc) => (
                       <Chip
                         key={acc.id}
                         label={`${acc.name} (${acc.currency})`}
-                        selected={toAccountId === acc.id}
+                        selected={accountId === acc.id}
                         color={acc.color}
-                        onPress={() => setToAccountId(acc.id)}
+                        onPress={() => {
+                          setAccountId(acc.id);
+                          if (!isEditing) {
+                            setCurrency(acc.currency);
+                          }
+                        }}
                       />
                     ))}
-                </ScrollView>
+                  </ScrollView>
+                )}
 
-                {targetAccount && sourceAccount ? (
+                {isGoalDeposit && linkedGoal && linkedGoal.currency !== currency ? (
                   <View style={styles.targetAmountBox}>
                     <Text style={[styles.sectionLabel, { color: theme.colors.muted }]}>
-                      Hedef Hesaba Geçen Tutar ({targetAccount.currency})
+                      Hedef Kumbara Tutarı ({linkedGoal.currency})
                     </Text>
                     <TextInput
                       value={toAmountStr}
-                      onChangeText={setToAmountStr}
+                      onChangeText={(val) => {
+                        setToAmountStr(val);
+                        setToAmountTouched(val.trim().length > 0);
+                      }}
                       keyboardType="decimal-pad"
                       placeholder={
                         suggestedTargetAmount > 0
                           ? `Otomatik: ${amountToInputString(suggestedTargetAmount)}`
-                          : 'Hedef tutar'
+                          : 'Kumbara tutarı'
                       }
                       placeholderTextColor={theme.colors.muted}
                       style={[
@@ -703,6 +727,65 @@ export function QuickAddModal({
                   </View>
                 ) : null}
               </View>
+            ) : null}
+
+            {txType === 'transfer' ? (
+              !isGoalDeposit ? (
+                <View style={styles.section}>
+                  <Text style={[styles.sectionLabel, { color: theme.colors.muted }]}>
+                    Hedef Hesap
+                  </Text>
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.chipRow}
+                  >
+                    {selectableAccounts
+                      .filter((a) => isGoalWithdraw || a.id !== accountId)
+                      .map((acc) => (
+                        <Chip
+                          key={acc.id}
+                          label={`${acc.name} (${acc.currency})`}
+                          selected={toAccountId === acc.id}
+                          color={acc.color}
+                          onPress={() => setToAccountId(acc.id)}
+                        />
+                      ))}
+                  </ScrollView>
+
+                  {targetAccount && (sourceAccount || isGoalWithdraw) ? (
+                    <View style={styles.targetAmountBox}>
+                      <Text style={[styles.sectionLabel, { color: theme.colors.muted }]}>
+                        Hedef Hesaba Geçen Tutar ({targetAccount.currency})
+                      </Text>
+                      <TextInput
+                        value={toAmountStr}
+                        onChangeText={(val) => {
+                          setToAmountStr(val);
+                          setToAmountTouched(val.trim().length > 0);
+                        }}
+                        keyboardType="decimal-pad"
+                        placeholder={
+                          suggestedTargetAmount > 0
+                            ? `Otomatik: ${amountToInputString(suggestedTargetAmount)}`
+                            : 'Hedef tutar'
+                        }
+                        placeholderTextColor={theme.colors.muted}
+                        style={[
+                          styles.input,
+                          TABULAR_NUMS_STYLE,
+                          {
+                            backgroundColor: theme.colors.elevated,
+                            borderColor: theme.colors.border,
+                            color: theme.colors.text,
+                            borderRadius: theme.radius.md,
+                          },
+                        ]}
+                      />
+                    </View>
+                  ) : null}
+                </View>
+              ) : null
             ) : (
               <View style={styles.section}>
                 <Text style={[styles.sectionLabel, { color: theme.colors.muted }]}>
@@ -1112,6 +1195,25 @@ const styles = StyleSheet.create({
   scrollContent: {
     padding: 16,
     gap: 14,
+  },
+  goalBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  goalBadgeTextWrap: {
+    flex: 1,
+    gap: 2,
+  },
+  goalBadgeTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  goalBadgeSub: {
+    fontSize: 12,
   },
   amountCard: {
     borderWidth: 1,

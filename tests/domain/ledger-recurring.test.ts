@@ -122,6 +122,69 @@ describe('ledger engine: account balances', () => {
     // 100 - 50 = 50
     expect(computeAccountBalance(usdAccount, txs, '2026-11-20')).toBe(50);
   });
+
+  it('converts cross-currency USD expenses and transfers accurately for TRY bank & credit card accounts', () => {
+    const tryBank = makeAccount({
+      id: 'acc-try-bank',
+      type: 'bank',
+      currency: 'TRY',
+      initialBalance: 10_000,
+    });
+    const tryCard = makeAccount({
+      id: 'acc-try-card',
+      type: 'credit_card',
+      currency: 'TRY',
+      initialBalance: 0,
+      creditLimit: 50_000,
+      statementDay: 15,
+      dueDay: 25,
+    });
+
+    const txs: Transaction[] = [
+      makeTx({
+        id: 'usd-bank-exp',
+        type: 'expense',
+        amount: 100,
+        currency: 'USD',
+        exchangeRateToBase: 40,
+        baseAmount: 4_000,
+        accountId: tryBank.id,
+        date: '2026-11-10',
+      }),
+      makeTx({
+        id: 'usd-card-exp',
+        type: 'expense',
+        amount: 50,
+        currency: 'USD',
+        exchangeRateToBase: 40,
+        baseAmount: 2_000,
+        accountId: tryCard.id,
+        date: '2026-11-12',
+      }),
+    ];
+
+    // 10,000 TRY - (100 USD * 40) = 6,000 TRY
+    expect(computeAccountBalance(tryBank, txs, '2026-11-20', RATES)).toBe(6_000);
+
+    // 50 USD * 40 = 2,000 TRY debt on TRY card
+    const cardSummary = computeCreditCardSummary(tryCard, txs, '2026-11-20', RATES);
+    expect(cardSummary.totalDebt).toBe(2_000);
+    expect(cardSummary.availableLimit).toBe(48_000);
+    expect(computeAccountBalance(tryCard, txs, '2026-11-20', RATES)).toBe(-2_000);
+
+    const netWorth = computeNetWorth({
+      accounts: [tryBank, tryCard],
+      goals: [],
+      debts: [],
+      transactions: txs,
+      rates: RATES,
+      baseCurrency: 'TRY',
+      asOfDate: '2026-11-20',
+    });
+    expect(netWorth.totalAssets).toBe(6_000);
+    expect(netWorth.totalCardDebt).toBe(2_000);
+    expect(netWorth.netWorth).toBe(4_000);
+  });
 });
 
 describe('ledger engine: 2A credit card & net worth invariants', () => {

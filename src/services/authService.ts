@@ -1,7 +1,7 @@
 import type { SupabaseClient, User } from '@supabase/supabase-js';
 import { createDefaultExchangeRates, DEFAULT_SETTINGS } from '@/domain/defaults';
-import type { FinanceDataSnapshot } from '@/domain/types';
-import { getSupabaseClient, getWebBaseUrl } from '@/services/supabase';
+import type { FinanceDataSnapshot, Transaction } from '@/domain/types';
+import { getSupabaseClient, getWebBaseUrl, isSupabaseConfigured } from '@/services/supabase';
 import {
   fromSnakeAccountRow,
   fromSnakeBudgetRow,
@@ -13,6 +13,7 @@ import {
   fromSnakeSavingsGoalRow,
   fromSnakeTransactionRow,
   fromSnakeUserSettingsRow,
+  hasNonDemoLocalData,
   mergeLocalIntoCloud,
   type SnakeRow,
   toSnakeAccountRow,
@@ -301,7 +302,14 @@ export async function signOut(): Promise<void> {
   if (!client) {
     return;
   }
-  await client.auth.signOut();
+  try {
+    const { error } = await client.auth.signOut();
+    if (error) {
+      await client.auth.signOut({ scope: 'local' }).catch(() => {});
+    }
+  } catch {
+    await client.auth.signOut({ scope: 'local' }).catch(() => {});
+  }
 }
 
 /** Returns the currently authenticated Supabase user, or `null` when signed out / unconfigured. */
@@ -355,6 +363,169 @@ async function upsertUserRows(
   }
 }
 
+const RECEIPTS_BUCKET = 'receipts';
+const LOCAL_RECEIPT_URI_RE = /^(file:|content:|blob:|data:)/i;
+const SUPABASE_RECEIPT_URL_RE =
+  /\/storage\/v1\/object\/(?:sign|authenticated|public)\/receipts\/([^?#]+)/i;
+
+function decodeBase64ToBytes(base64: string): Uint8Array {
+  const cleaned = base64.replace(/\s+/g, '');
+  if (typeof globalThis.atob === 'function') {
+    const bin = globalThis.atob(cleaned);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return bytes;
+  }
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const padding = cleaned.endsWith('==') ? 2 : cleaned.endsWith('=') ? 1 : 0;
+  const len = (cleaned.length * 3) / 4 - padding;
+  const bytes = new Uint8Array(Math.max(0, len));
+  let p = 0;
+  for (let i = 0; i < cleaned.length; i += 4) {
+    const a = alphabet.indexOf(cleaned[i]);
+    const b = alphabet.indexOf(cleaned[i + 1]);
+    const c = cleaned[i + 2] === '=' ? 0 : alphabet.indexOf(cleaned[i + 2]);
+    const d = cleaned[i + 3] === '=' ? 0 : alphabet.indexOf(cleaned[i + 3]);
+    const triple = (a << 18) | (b << 12) | (c << 6) | d;
+    if (p < len) bytes[p++] = (triple >> 16) & 0xff;
+    if (p < len) bytes[p++] = (triple >> 8) & 0xff;
+    if (p < len) bytes[p++] = triple & 0xff;
+  }
+  return bytes;
+}
+
+async function readLocalReceiptBytes(
+  uri: string,
+): Promise<{ bytes: Uint8Array; contentType: string } | null> {
+  const trimmed = uri.trim();
+  if (trimmed.startsWith('data:')) {
+    const commaIdx = trimmed.indexOf(',');
+    if (commaIdx < 0) {
+      return null;
+    }
+    const meta = trimmed.slice(5, commaIdx);
+    const payload = trimmed.slice(commaIdx + 1);
+    const contentType = meta.split(';')[0]?.trim() || 'image/jpeg';
+    if (meta.includes(';base64')) {
+      const bytes = decodeBase64ToBytes(payload);
+      return bytes.byteLength > 0 ? { bytes, contentType } : null;
+    }
+    const decoded = decodeURIComponent(payload);
+    const bytes = new TextEncoder().encode(decoded);
+    return bytes.byteLength > 0 ? { bytes, contentType } : null;
+  }
+
+  if (typeof fetch === 'function') {
+    try {
+      const response = await fetch(trimmed);
+      if (response.ok) {
+        const buffer = await response.arrayBuffer();
+        if (buffer.byteLength > 0) {
+          const headerType = response.headers?.get('content-type')?.split(';')[0]?.trim();
+          return {
+            bytes: new Uint8Array(buffer),
+            contentType: headerType || 'image/jpeg',
+          };
+        }
+      }
+    } catch {
+      // Fall back to expo-file-system on native
+    }
+  }
+
+  try {
+    const fs = await import('expo-file-system');
+    const file = new fs.File(trimmed);
+    const bytes = await file.bytes();
+    if (bytes.byteLength > 0) {
+      return { bytes, contentType: 'image/jpeg' };
+    }
+  } catch {
+    // Unreadable file or unsupported runtime
+  }
+
+  return null;
+}
+
+async function uploadReceiptForTransaction(
+  client: SupabaseClient,
+  userId: string,
+  tx: Transaction,
+): Promise<string | null> {
+  const uri = tx.receiptUri?.trim();
+  if (!uri) {
+    return null;
+  }
+
+  const signedMatch = SUPABASE_RECEIPT_URL_RE.exec(uri);
+  if (signedMatch) {
+    return decodeURIComponent(signedMatch[1]);
+  }
+
+  if (!LOCAL_RECEIPT_URI_RE.test(uri)) {
+    return uri;
+  }
+
+  if (!client.storage?.from) {
+    return null;
+  }
+
+  try {
+    const payload = await readLocalReceiptBytes(uri);
+    if (!payload) {
+      return null;
+    }
+    const storagePath = `${userId}/${tx.id}.jpg`;
+    const { error } = await client.storage
+      .from(RECEIPTS_BUCKET)
+      .upload(storagePath, payload.bytes, {
+        contentType: payload.contentType,
+        upsert: true,
+      });
+    if (error) {
+      return null;
+    }
+    return storagePath;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolves a stored Supabase `receipts` bucket path into a short-lived signed URL (best-effort). */
+export async function resolveReceiptDisplayUrl(
+  client: SupabaseClient,
+  receiptUri: string | null | undefined,
+  expiresInSeconds = 3600,
+): Promise<string | null> {
+  if (!receiptUri) {
+    return null;
+  }
+  const trimmed = receiptUri.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^(https?:|file:|content:|blob:|data:)/i.test(trimmed)) {
+    return trimmed;
+  }
+  if (!client.storage?.from) {
+    return trimmed;
+  }
+  const storagePath = trimmed.replace(/^receipts\//, '');
+  try {
+    const { data, error } = await client.storage
+      .from(RECEIPTS_BUCKET)
+      .createSignedUrl(storagePath, expiresInSeconds);
+    if (!error && data?.signedUrl) {
+      return data.signedUrl;
+    }
+  } catch {
+    // Keep storage path on failure
+  }
+  return trimmed;
+}
+
 /** Fetches the complete cloud finance snapshot for `userId` from Supabase. */
 export async function fetchRemoteFinanceData(userId: string): Promise<FinanceDataSnapshot> {
   const client = requireConfiguredClient();
@@ -396,11 +567,21 @@ export async function fetchRemoteFinanceData(userId: string): Promise<FinanceDat
   }
 
   const mappedRates = ((rateResult.data ?? []) as SnakeRow[]).map(fromSnakeExchangeRateRow);
+  const mappedTransactions = await Promise.all(
+    transactionRows.map(async (row) => {
+      const tx = fromSnakeTransactionRow(row);
+      if (!tx.receiptUri || tx.deletedAt !== null) {
+        return tx;
+      }
+      const displayUrl = await resolveReceiptDisplayUrl(client, tx.receiptUri);
+      return displayUrl === tx.receiptUri ? tx : { ...tx, receiptUri: displayUrl };
+    }),
+  );
 
   return {
     accounts: accountRows.map(fromSnakeAccountRow),
     categories: categoryRows.map(fromSnakeCategoryRow),
-    transactions: transactionRows.map(fromSnakeTransactionRow),
+    transactions: mappedTransactions,
     installmentPlans: planRows.map(fromSnakeInstallmentPlanRow),
     recurringRules: ruleRows.map(fromSnakeRecurringRuleRow),
     budgets: budgetRows.map(fromSnakeBudgetRow),
@@ -453,15 +634,39 @@ export async function pushFinanceDataToCloud(
     'debts',
     nonDemo(data.debts).map((d) => toSnakeDebtRow(d, userId)),
   );
+
+  const preparedTransactions = await Promise.all(
+    nonDemo(data.transactions).map(async (tx) => {
+      if (tx.deletedAt !== null || !tx.receiptUri) {
+        return tx;
+      }
+      const resolvedReceiptUri = await uploadReceiptForTransaction(client, userId, tx);
+      return resolvedReceiptUri === tx.receiptUri
+        ? tx
+        : { ...tx, receiptUri: resolvedReceiptUri };
+    }),
+  );
+
   await upsertUserRows(
     client,
     'transactions',
-    nonDemo(data.transactions).map((t) => toSnakeTransactionRow(t, userId)),
+    preparedTransactions.map((t) => toSnakeTransactionRow(t, userId)),
+  );
+
+  // Upsert budget tombstones before active rows so the partial unique index
+  // (WHERE deleted_at IS NULL) does not conflict on replaced (category, month) limits.
+  const nonDemoBudgets = nonDemo(data.budgets);
+  const budgetTombstones = nonDemoBudgets.filter((b) => b.deletedAt !== null);
+  const activeBudgets = nonDemoBudgets.filter((b) => b.deletedAt === null);
+  await upsertUserRows(
+    client,
+    'budgets',
+    budgetTombstones.map((b) => toSnakeBudgetRow(b, userId)),
   );
   await upsertUserRows(
     client,
     'budgets',
-    nonDemo(data.budgets).map((b) => toSnakeBudgetRow(b, userId)),
+    activeBudgets.map((b) => toSnakeBudgetRow(b, userId)),
   );
 
   // exchange_rates & user_settings use partial unique indexes (WHERE deleted_at IS NULL),
@@ -537,7 +742,7 @@ export async function syncWithSupabase(
   mode: 'merge' | 'cloud_only' = 'merge',
 ): Promise<{ nextState: FinanceDataSnapshot; syncedAt: string }> {
   const remoteSnapshot = await fetchRemoteFinanceData(userId);
-  const { nextState, toUpload } = mergeLocalIntoCloud(localSnapshot, remoteSnapshot, mode);
+  const { nextState, toUpload } = mergeLocalIntoCloud(localSnapshot, remoteSnapshot, mode, userId);
 
   if (mode === 'merge') {
     await pushFinanceDataToCloud(userId, toUpload);
@@ -547,4 +752,69 @@ export async function syncWithSupabase(
     nextState,
     syncedAt: new Date().toISOString(),
   };
+}
+
+export type AutoSyncOutcome =
+  | { status: 'no_session' }
+  | { status: 'local_conflict' }
+  | { status: 'synced'; syncedAt: string }
+  | { status: 'offline' }
+  | { status: 'error'; message: string };
+
+function isLikelyNetworkError(err: unknown): boolean {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /network|fetch|offline|timeout|internet|connection|econn|enotfound/i.test(msg);
+}
+
+/**
+ * Runs startup or foreground-resume cloud synchronization when an active Supabase
+ * session exists, deferring to Settings Merge/Replace when unsynced non-demo local data exists.
+ */
+export async function syncSessionIfEligible(storeAccess: {
+  getSnapshot: () => FinanceDataSnapshot;
+  getLastSyncedAt: () => string | null;
+  getSyncStatus: () => 'local' | 'syncing' | 'synced' | 'offline' | 'error';
+  setSyncStatus: (status: 'local' | 'syncing' | 'synced' | 'offline' | 'error') => void;
+  applyCloudState: (state: FinanceDataSnapshot) => void;
+}): Promise<AutoSyncOutcome> {
+  if (!isSupabaseConfigured()) {
+    return { status: 'no_session' };
+  }
+
+  const user = await getCurrentSession();
+  if (!user) {
+    return { status: 'no_session' };
+  }
+
+  const snapshot = storeAccess.getSnapshot();
+  if (storeAccess.getLastSyncedAt() === null && hasNonDemoLocalData(snapshot)) {
+    if (storeAccess.getSyncStatus() !== 'local') {
+      storeAccess.setSyncStatus('local');
+    }
+    return { status: 'local_conflict' };
+  }
+
+  storeAccess.setSyncStatus('syncing');
+  try {
+    const { nextState, syncedAt } = await syncWithSupabase(user.id, snapshot, 'merge');
+    const activeSession = await getCurrentSession();
+    if (!activeSession || activeSession.id !== user.id) {
+      return { status: 'no_session' };
+    }
+    storeAccess.applyCloudState(nextState);
+    return { status: 'synced', syncedAt };
+  } catch (err) {
+    if (isLikelyNetworkError(err)) {
+      storeAccess.setSyncStatus('offline');
+      return { status: 'offline' };
+    }
+    storeAccess.setSyncStatus('error');
+    return {
+      status: 'error',
+      message: err instanceof Error ? err.message : 'Senkronizasyon başarısız oldu.',
+    };
+  }
 }

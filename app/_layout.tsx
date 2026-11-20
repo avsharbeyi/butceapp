@@ -1,12 +1,12 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Stack, usePathname } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { AlertTriangle, Info, X } from 'lucide-react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LockScreenOverlay } from '@/components/ui/LockScreenOverlay';
-import { toIsoDate } from '@/domain/periods';
-import { getCurrentSession } from '@/services/authService';
+import { getLocalTodayIso } from '@/domain/periods';
+import { syncSessionIfEligible } from '@/services/authService';
 import {
   notifyBudgetThreshold,
   scheduleUpcomingReminders,
@@ -14,11 +14,6 @@ import {
 import { hasPin } from '@/services/securityService';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { useResponsiveLayout, useTheme } from '@/theme/theme';
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
 
 function parseBudgetAlertInfo(
   title: string,
@@ -148,13 +143,31 @@ function RootShell() {
   const accounts = useFinanceStore((s) => s.accounts);
   const runDueRecurringRules = useFinanceStore((s) => s.runDueRecurringRules);
   const refreshLiveRates = useFinanceStore((s) => s.refreshLiveRates);
-  const setSyncStatus = useFinanceStore((s) => s.setSyncStatus);
 
   const [isLocked, setIsLocked] = useState(false);
   const startupDoneRef = useRef(false);
+  const syncInFlightRef = useRef(false);
   const wasBackgroundRef = useRef(AppState.currentState === 'background');
 
   const isSharedRoute = pathname === '/shared' || pathname.startsWith('/shared/');
+
+  const runAutoCloudSync = useCallback(() => {
+    if (!useFinanceStore.getState().hasHydrated || syncInFlightRef.current) {
+      return;
+    }
+    syncInFlightRef.current = true;
+    void syncSessionIfEligible({
+      getSnapshot: () => useFinanceStore.getState().getDataSnapshot(),
+      getLastSyncedAt: () => useFinanceStore.getState().lastSyncedAt,
+      getSyncStatus: () => useFinanceStore.getState().syncStatus,
+      setSyncStatus: (status) => useFinanceStore.getState().setSyncStatus(status),
+      applyCloudState: (nextState) => useFinanceStore.getState().applyCloudState(nextState),
+    })
+      .catch(() => {})
+      .finally(() => {
+        syncInFlightRef.current = false;
+      });
+  }, []);
 
   useEffect(() => {
     if (!hasHydrated || startupDoneRef.current) {
@@ -164,14 +177,7 @@ function RootShell() {
 
     runDueRecurringRules(getLocalTodayIso());
     void refreshLiveRates().catch(() => {});
-
-    void getCurrentSession()
-      .then((user) => {
-        if (user && useFinanceStore.getState().syncStatus === 'local') {
-          setSyncStatus('synced');
-        }
-      })
-      .catch(() => {});
+    runAutoCloudSync();
 
     if (appLockEnabled) {
       void hasPin()
@@ -182,7 +188,7 @@ function RootShell() {
         })
         .catch(() => {});
     }
-  }, [hasHydrated, appLockEnabled, runDueRecurringRules, refreshLiveRates, setSyncStatus]);
+  }, [hasHydrated, appLockEnabled, runDueRecurringRules, refreshLiveRates, runAutoCloudSync]);
 
   useEffect(() => {
     if (!hasHydrated || !notificationsEnabled) {
@@ -206,6 +212,7 @@ function RootShell() {
 
       if (nextState === 'active' && wasBackgroundRef.current) {
         wasBackgroundRef.current = false;
+        runAutoCloudSync();
         if (useFinanceStore.getState().settings.appLockEnabled) {
           void hasPin()
             .then((pinExists) => {
@@ -221,7 +228,7 @@ function RootShell() {
     return () => {
       subscription.remove();
     };
-  }, []);
+  }, [runAutoCloudSync]);
 
   return (
     <View style={[styles.root, { backgroundColor: theme.colors.background }]}>

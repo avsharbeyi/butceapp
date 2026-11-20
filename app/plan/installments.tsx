@@ -8,15 +8,10 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { MoneyText } from '@/components/ui/MoneyText';
 import { convertAmount, ratesListToMap } from '@/domain/currency';
 import { addMoney } from '@/domain/money';
-import { getFiscalMonthKey, getFiscalMonthRange, parseIsoDate, toIsoDate } from '@/domain/periods';
+import { getFiscalMonthKey, getFiscalMonthRange, getLocalTodayIso, parseIsoDate } from '@/domain/periods';
 import type { InstallmentPlan } from '@/domain/types';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { TABULAR_NUMS_STYLE, useResponsiveLayout, useTheme } from '@/theme/theme';
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
 
 function formatShortTrDate(isoDate: string): string {
   try {

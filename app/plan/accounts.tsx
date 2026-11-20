@@ -33,7 +33,7 @@ import { SegmentedControl } from '@/components/ui/SegmentedControl';
 import { convertAmount, ratesListToMap } from '@/domain/currency';
 import { computeAccountBalance, computeCreditCardSummary } from '@/domain/ledger';
 import { addMoney, roundMoney } from '@/domain/money';
-import { parseIsoDate, toIsoDate } from '@/domain/periods';
+import { getLocalTodayIso, parseIsoDate } from '@/domain/periods';
 import type { Account, AccountType, CurrencyCode } from '@/domain/types';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { TABULAR_NUMS_STYLE, useResponsiveLayout, useTheme } from '@/theme/theme';
@@ -71,11 +71,6 @@ const COLOR_SWATCHES = [
   '#EC4899',
   '#14B8A6',
 ] as const;
-
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
 
 function parseDecimalInput(raw: string, allowZero = false, allowNegative = false): number | null {
   const normalized = raw.trim().replace(/\s+/g, '').replace(',', '.');
@@ -164,13 +159,13 @@ export default function AccountsScreen() {
 
     for (const acc of activeAccounts) {
       if (acc.type === 'credit_card') {
-        const card = computeCreditCardSummary(acc, transactions, todayIso);
+        const card = computeCreditCardSummary(acc, transactions, todayIso, ratesMap);
         totalCardDebt = addMoney(
           totalCardDebt,
           convertAmount(card.totalDebt, acc.currency, settings.baseCurrency, ratesMap),
         );
       } else {
-        const bal = computeAccountBalance(acc, transactions, todayIso);
+        const bal = computeAccountBalance(acc, transactions, todayIso, ratesMap);
         totalAssets = addMoney(
           totalAssets,
           convertAmount(bal, acc.currency, settings.baseCurrency, ratesMap),
@@ -267,14 +262,16 @@ export default function AccountsScreen() {
         setFormError('Kredi kartı için 0’dan büyük bir kart limiti girin.');
         return;
       }
-      const stDay = Number.parseInt(statementDayStr.trim(), 10);
-      const duDay = Number.parseInt(dueDayStr.trim(), 10);
-      if (!Number.isInteger(stDay) || stDay < 1 || stDay > 31) {
-        setFormError('Hesap kesim günü 1 ile 31 arasında olmalıdır.');
+      const stTrimmed = statementDayStr.trim();
+      const duTrimmed = dueDayStr.trim();
+      const stDay = /^\d+$/.test(stTrimmed) ? Number(stTrimmed) : Number.NaN;
+      const duDay = /^\d+$/.test(duTrimmed) ? Number(duTrimmed) : Number.NaN;
+      if (!Number.isInteger(stDay) || stDay < 1 || stDay > 28) {
+        setFormError('Hesap kesim günü 1 ile 28 arasında olmalıdır.');
         return;
       }
-      if (!Number.isInteger(duDay) || duDay < 1 || duDay > 31) {
-        setFormError('Son ödeme günü 1 ile 31 arasında olmalıdır.');
+      if (!Number.isInteger(duDay) || duDay < 1 || duDay > 28) {
+        setFormError('Son ödeme günü 1 ile 28 arasında olmalıdır.');
         return;
       }
       parsedLimit = limitVal;
@@ -315,7 +312,7 @@ export default function AccountsScreen() {
   };
 
   const openPayCardModal = (card: Account) => {
-    const cardSummary = computeCreditCardSummary(card, transactions, todayIso);
+    const cardSummary = computeCreditCardSummary(card, transactions, todayIso, ratesMap);
     const defaultAmt =
       cardSummary.statementDue > 0 ? cardSummary.statementDue : cardSummary.totalDebt;
 
@@ -333,8 +330,8 @@ export default function AccountsScreen() {
 
   const payCardSummary = useMemo(() => {
     if (!payCardTarget) return null;
-    return computeCreditCardSummary(payCardTarget, transactions, todayIso);
-  }, [payCardTarget, transactions, todayIso]);
+    return computeCreditCardSummary(payCardTarget, transactions, todayIso, ratesMap);
+  }, [payCardTarget, transactions, todayIso, ratesMap]);
 
   const parsedPayAmount = useMemo(() => parseDecimalInput(payAmountStr, false, false), [payAmountStr]);
 
@@ -391,9 +388,11 @@ export default function AccountsScreen() {
   };
 
   const renderAccountCard = (acc: Account) => {
-    const balance = computeAccountBalance(acc, transactions, todayIso);
+    const balance = computeAccountBalance(acc, transactions, todayIso, ratesMap);
     const isCard = acc.type === 'credit_card';
-    const cardSummary = isCard ? computeCreditCardSummary(acc, transactions, todayIso) : null;
+    const cardSummary = isCard
+      ? computeCreditCardSummary(acc, transactions, todayIso, ratesMap)
+      : null;
     const limit = acc.creditLimit ?? 0;
     const limitUsagePct =
       cardSummary && limit > 0 ? Math.min(100, Math.round((cardSummary.totalDebt / limit) * 100)) : 0;
@@ -782,7 +781,7 @@ export default function AccountsScreen() {
                   <View style={styles.twoColRow}>
                     <View style={styles.twoColCell}>
                       <Text style={[styles.fieldLabel, { color: theme.colors.muted }]}>
-                        Kesim Günü (1–31)
+                        Kesim Günü (1–28)
                       </Text>
                       <TextInput
                         value={statementDayStr}
@@ -803,7 +802,7 @@ export default function AccountsScreen() {
                     </View>
                     <View style={styles.twoColCell}>
                       <Text style={[styles.fieldLabel, { color: theme.colors.muted }]}>
-                        Son Ödeme (1–31)
+                        Son Ödeme (1–28)
                       </Text>
                       <TextInput
                         value={dueDayStr}

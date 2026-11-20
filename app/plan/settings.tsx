@@ -32,8 +32,8 @@ import { Card } from '@/components/ui/Card';
 import { Chip } from '@/components/ui/Chip';
 import { ConfirmModal } from '@/components/ui/ConfirmModal';
 import { SegmentedControl } from '@/components/ui/SegmentedControl';
-import { toIsoDate } from '@/domain/periods';
-import type { CurrencyCode, FinanceDataSnapshot, ThemeMode } from '@/domain/types';
+import { getLocalTodayIso } from '@/domain/periods';
+import type { CurrencyCode, ThemeMode } from '@/domain/types';
 import {
   type AuthUser,
   getCurrentSession,
@@ -53,6 +53,7 @@ import {
   savePin,
 } from '@/services/securityService';
 import { isSupabaseConfigured } from '@/services/supabase';
+import { hasNonDemoLocalData } from '@/services/syncEngine';
 import { useFinanceStore } from '@/store/useFinanceStore';
 import { TABULAR_NUMS_STYLE, useResponsiveLayout, useTheme } from '@/theme/theme';
 
@@ -85,11 +86,6 @@ const COLOR_SWATCHES = [
   '#14B8A6',
 ] as const;
 
-function getLocalTodayIso(): string {
-  const now = new Date();
-  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
-}
-
 function formatDateTimeTr(iso: string | null): string {
   if (!iso) return 'Henüz eşitlenmedi';
   const d = new Date(iso);
@@ -101,24 +97,6 @@ function formatDateTimeTr(iso: string | null): string {
     hour: '2-digit',
     minute: '2-digit',
   }).format(d);
-}
-
-function hasNonDemoLocalData(snapshot: FinanceDataSnapshot): boolean {
-  const hasReal = <T extends { deletedAt: string | null; isDemo?: boolean }>(items: T[]) =>
-    items.some((item) => item.deletedAt === null && item.isDemo !== true);
-
-  return (
-    hasReal(snapshot.accounts) ||
-    hasReal(snapshot.transactions) ||
-    hasReal(snapshot.installmentPlans) ||
-    hasReal(snapshot.recurringRules) ||
-    hasReal(snapshot.budgets) ||
-    hasReal(snapshot.savingsGoals) ||
-    hasReal(snapshot.debts) ||
-    snapshot.categories.some(
-      (c) => c.deletedAt === null && !c.isDefault && c.isDemo !== true,
-    )
-  );
 }
 
 export default function SettingsScreen() {
@@ -361,14 +339,23 @@ export default function SettingsScreen() {
 
   const handleSignOut = async () => {
     setSignOutConfirmVisible(false);
-    await signOut();
-    clearUserLocalDataOnSignOut();
-    autoCheckedUsersRef.current.clear();
-    setSessionUser(null);
-    setAuthFeedback({
-      type: 'info',
-      text: 'Çıkış yapıldı ve yerel kullanıcı verileri temizlendi.',
-    });
+    let remoteSignOutFailed = false;
+    try {
+      await signOut();
+    } catch {
+      remoteSignOutFailed = true;
+    } finally {
+      clearUserLocalDataOnSignOut();
+      autoCheckedUsersRef.current.clear();
+      setSessionUser(null);
+      setMergePromptUser(null);
+      setAuthFeedback({
+        type: 'info',
+        text: remoteSignOutFailed
+          ? 'Yerel oturum ve kullanıcı verileri temizlendi (sunucu oturumu çevrimdışı kapatılamadı).'
+          : 'Çıkış yapıldı ve yerel kullanıcı verileri temizlendi.',
+      });
+    }
   };
 
   const handleToggleNotifications = async (nextVal: boolean) => {

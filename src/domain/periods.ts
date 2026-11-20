@@ -41,6 +41,11 @@ export function toIsoDate(year: number, month1To12: number, day: number): string
   return `${String(year).padStart(4, '0')}-${pad2(month1To12)}-${pad2(day)}`;
 }
 
+/** Returns the local calendar date (`YYYY-MM-DD`) without UTC shift. */
+export function getLocalTodayIso(now = new Date()): string {
+  return toIsoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
+}
+
 /** Returns the number of days in the given year and 1-based month using UTC calendar math. */
 export function daysInMonth(year: number, month1To12: number): number {
   return new Date(Date.UTC(year, month1To12, 0)).getUTCDate();

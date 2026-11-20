@@ -1,6 +1,6 @@
 import { convertAmount, DEFAULT_EXCHANGE_RATES, getRateToBase } from './currency';
 import { splitInstallmentAmounts } from './money';
-import { addDays, addMonthsClamped, parseIsoDate } from './periods';
+import { addDays, addMonthsClamped, getLocalTodayIso, parseIsoDate } from './periods';
 import type {
   Account,
   Budget,
@@ -100,7 +100,7 @@ function demoUuid(suffix: number): string {
 
 /** Builds a rich, self-consistent Turkish demo dataset with every entity flagged `isDemo: true`. */
 export function buildDemoDataset(
-  anchorDate = new Date().toISOString().slice(0, 10),
+  anchorDate = getLocalTodayIso(),
 ): FinanceDataSnapshot {
   parseIsoDate(anchorDate);
   const nowIso = `${anchorDate}T09:00:00.000Z`;
