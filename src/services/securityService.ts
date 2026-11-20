@@ -34,8 +34,8 @@ function constantTimeEqual(a: string, b: string): boolean {
 }
 
 /**
- * Computes a domain-salted SHA-256 hex digest of `pin` using Web Crypto,
- * Node `crypto`, or `expo-crypto` fallback.
+ * Computes a domain-salted SHA-256 hex digest of `pin` using Web Crypto
+ * (`globalThis.crypto.subtle`) or `expo-crypto` fallback on Native.
  */
 export async function hashPin(pin: string): Promise<string> {
   const input = `${PIN_DOMAIN_SALT}${pin}`;
@@ -44,14 +44,6 @@ export async function hashPin(pin: string): Promise<string> {
     const encoded = new TextEncoder().encode(input);
     const buffer = await globalThis.crypto.subtle.digest('SHA-256', encoded);
     return bytesToHex(new Uint8Array(buffer));
-  }
-
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const nodeCrypto = require('node:crypto') as typeof import('node:crypto');
-    return nodeCrypto.createHash('sha256').update(input, 'utf8').digest('hex');
-  } catch {
-    // Fall through to expo-crypto on Native runtimes lacking SubtleCrypto
   }
 
   const ExpoCrypto = await import('expo-crypto');

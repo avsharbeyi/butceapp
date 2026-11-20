@@ -88,23 +88,29 @@ function bytesToBase64Url(bytes: Uint8Array): string {
   return out;
 }
 
+function isReactNativeRuntime(): boolean {
+  return (
+    typeof navigator !== 'undefined' &&
+    (navigator as { product?: string }).product === 'ReactNative'
+  );
+}
+
 function getRandomBytes(byteLength: number): Uint8Array {
   if (typeof globalThis.crypto?.getRandomValues === 'function') {
     const bytes = new Uint8Array(byteLength);
     globalThis.crypto.getRandomValues(bytes);
     return bytes;
   }
-  try {
+
+  if (isReactNativeRuntime()) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const nodeCrypto = require('node:crypto') as typeof import('node:crypto');
-    return new Uint8Array(nodeCrypto.randomBytes(byteLength));
-  } catch {
-    const fallback = new Uint8Array(byteLength);
-    for (let i = 0; i < byteLength; i += 1) {
-      fallback[i] = Math.floor(Math.random() * 256);
+    const ExpoCrypto = require('expo-crypto') as typeof import('expo-crypto');
+    if (typeof ExpoCrypto.getRandomBytes === 'function') {
+      return ExpoCrypto.getRandomBytes(byteLength);
     }
-    return fallback;
   }
+
+  throw new Error('Kriptografik rastgele sayı üreticisi (CSPRNG) kullanılamıyor.');
 }
 
 /** Generates a cryptographically random URL-safe share token (>= 32 characters). */

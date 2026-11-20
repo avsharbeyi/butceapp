@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultExchangeRates } from '@/domain/defaults';
 import type { Account, RecurringRule, ReportSnapshot } from '@/domain/types';
 import {
@@ -247,6 +247,15 @@ describe('sharedReportService', () => {
       tokens.add(token);
     }
     expect(tokens.size).toBe(20);
+  });
+
+  it('throws explicitly instead of using Math.random when no CSPRNG is available', () => {
+    vi.stubGlobal('crypto', {});
+    try {
+      expect(() => generateShareToken()).toThrow(/CSPRNG/i);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('builds share URLs ending with /shared/<token>', () => {
