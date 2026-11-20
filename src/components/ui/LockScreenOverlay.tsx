@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Modal, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Delete, Fingerprint, Lock } from 'lucide-react-native';
 import {
@@ -27,6 +27,11 @@ export function LockScreenOverlay({ visible, onUnlocked }: LockScreenOverlayProp
   const [biometricReady, setBiometricReady] = useState(false);
   const [pinConfigured, setPinConfigured] = useState(true);
   const [checking, setChecking] = useState(false);
+  const onUnlockedRef = useRef(onUnlocked);
+
+  useEffect(() => {
+    onUnlockedRef.current = onUnlocked;
+  }, [onUnlocked]);
 
   const handleBiometricUnlock = useCallback(async () => {
     setChecking(true);
@@ -35,12 +40,12 @@ export function LockScreenOverlay({ visible, onUnlocked }: LockScreenOverlayProp
       const ok = await authenticateWithBiometrics();
       if (ok) {
         setPin('');
-        onUnlocked();
+        onUnlockedRef.current();
       }
     } finally {
       setChecking(false);
     }
-  }, [onUnlocked]);
+  }, []);
 
   useEffect(() => {
     if (!visible) {
@@ -62,7 +67,7 @@ export function LockScreenOverlay({ visible, onUnlocked }: LockScreenOverlayProp
         const ok = await authenticateWithBiometrics();
         if (!cancelled && ok) {
           setPin('');
-          onUnlocked();
+          onUnlockedRef.current();
         }
       }
     }
@@ -71,7 +76,7 @@ export function LockScreenOverlay({ visible, onUnlocked }: LockScreenOverlayProp
     return () => {
       cancelled = true;
     };
-  }, [visible, onUnlocked]);
+  }, [visible]);
 
   const handleDigit = (digit: string) => {
     if (checking || pin.length >= 6) return;
