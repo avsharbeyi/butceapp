@@ -783,8 +783,9 @@ describe('JSON Backup, HTML Report & Store Integration', () => {
       isArchived: false,
     });
 
+    const futureUpdatedAt = new Date(Date.now() + 60_000).toISOString();
     const backupOnlyA = makeSnapshot({
-      accounts: [{ ...accA, name: 'Hesap A Güncel', updatedAt: LATER }],
+      accounts: [{ ...accA, name: 'Hesap A Güncel', updatedAt: futureUpdatedAt }],
       categories: useFinanceStore.getState().categories,
     });
 
