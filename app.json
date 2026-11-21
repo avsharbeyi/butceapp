@@ -8,9 +8,11 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.avsharbeyi.butceapp"
     },
     "android": {
+      "package": "com.avsharbeyi.butceapp",
       "edgeToEdgeEnabled": true
     },
     "web": {
